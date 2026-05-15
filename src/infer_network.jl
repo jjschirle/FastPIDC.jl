@@ -47,8 +47,14 @@ function get_nodes_h5(
         
         # Determine Dense vs Sparse dynamically
         if isa(data_obj, HDF5.Group)
-            if !all(k -> haskey(data_obj, k), ["data", "indices", "indptr", "shape"])
-                throw(ArgumentError("Sparse matrix group '$matrix_key' is missing required components."))
+            # Validate Datasets
+            if !all(k -> haskey(data_obj, k), ["data", "indices", "indptr"])
+                throw(ArgumentError("Sparse matrix group '$matrix_key' is missing required datasets: 'data', 'indices', or 'indptr'."))
+            end
+
+            # Validate Attributes
+            if !haskey(attributes(data_obj), "shape")
+                throw(ArgumentError("Sparse matrix group '$matrix_key' is missing the required attribute: 'shape'."))
             end
             
             shape = tuple(read_attribute(data_obj, "shape")...)
