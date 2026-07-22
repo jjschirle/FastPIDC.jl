@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "fc64598ad0310e40bde0400070a008871b6033f1"
+project_hash = "518057afcbecd8103d9ec55f7e237f8874c8f0e9"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -165,12 +165,6 @@ git-tree-sha1 = "9e2f36d3c96a820c678f2f1f1782582fcf685bae"
 uuid = "8bb1440f-4735-579b-a4ab-409b98df4dab"
 version = "1.9.1"
 
-[[deps.Discretizers]]
-deps = ["DataStructures", "SpecialFunctions", "Statistics", "StatsBase"]
-git-tree-sha1 = "3ac8e0ed0f999053c897bc5d2adf1c01d16afc00"
-uuid = "6e83dbb3-75ca-525b-8ae2-3751f0dd50b4"
-version = "3.2.4"
-
 [[deps.Distributed]]
 deps = ["Random", "Serialization", "Sockets"]
 uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
@@ -208,7 +202,7 @@ uuid = "e2ba6199-217a-4e67-a87a-7c52f15ade04"
 version = "0.1.10"
 
 [[deps.FastPIDC]]
-deps = ["Atomix", "CUDA", "DelimitedFiles", "Distributed", "Distributions", "InformationMeasures", "LinearAlgebra", "NPZ", "Pkg", "Printf", "SharedArrays", "SparseArrays", "Statistics"]
+deps = ["Atomix", "CUDA", "DelimitedFiles", "Distributed", "Distributions", "LinearAlgebra", "NPZ", "Pkg", "Printf", "SharedArrays", "SparseArrays", "Statistics"]
 path = "."
 uuid = "2e136e29-5425-4b9c-aa6d-e9e617c08fea"
 version = "0.1.1"
@@ -309,12 +303,6 @@ deps = ["LinearAlgebra", "OpenLibm_jll", "SpecialFunctions"]
 git-tree-sha1 = "68c173f4f449de5b438ee67ed0c9c748dc31a2ec"
 uuid = "34004b35-14d8-5ef3-9330-4cdb6864b03a"
 version = "0.3.28"
-
-[[deps.InformationMeasures]]
-deps = ["Discretizers"]
-git-tree-sha1 = "874d48f2026e8faf3fd55c86973fd028b02cd1a0"
-uuid = "96684042-fbdc-5399-9b8e-d34e539a126c"
-version = "0.3.1"
 
 [[deps.InteractiveUtils]]
 deps = ["Markdown"]

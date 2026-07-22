@@ -1,6 +1,5 @@
 module FastPIDC
 
-using InformationMeasures
 using Distributions
 using Distributed
 using Pkg
@@ -29,6 +28,8 @@ export
     get_adjacency_matrix,
     infer_network
 
+include("discretizers.jl")
+include("information_measures.jl")
 include("common.jl")
 export PIDCConfig # New addition
 include("puc_full.jl")
