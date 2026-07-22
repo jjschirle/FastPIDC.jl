@@ -174,10 +174,29 @@ struct DiscretizeBayesianBlocks <: DiscretizationAlgorithm end
 
 function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {N<:AbstractFloat}
 
-    unique_data = unique(data)
-    unique_data = sort(unique_data)
+    # Single sorted pass to get unique values together with their multiplicities,
+    # rather than sorting/uniquing separately and then re-scanning the full
+    # data array once per unique value (which is O(n_unique * length(data))).
+    sorted_data = sort(vec(data))
+    m = length(sorted_data)
 
-    n = length(unique_data) # Number of observations
+    unique_data = Vector{Float64}(undef, m)
+    nn_vec = Vector{Float64}(undef, m)
+    n = 0
+    i = 1
+    @inbounds while i <= m
+        v = sorted_data[i]
+        j = i + 1
+        while j <= m && sorted_data[j] == v
+            j += 1
+        end
+        n += 1
+        unique_data[n] = v
+        nn_vec[n] = j - i
+        i = j
+    end
+    resize!(unique_data, n)
+    resize!(nn_vec, n)
 
     edges = zeros(n + 1)
     edges[1] = unique_data[1]
@@ -187,30 +206,44 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
     edges[end] = unique_data[end]
     block_length = unique_data[end] .- edges
 
-    if length(unique_data) == length(data)
-        nn_vec = ones(length(data))
-    else
-        nn_vec =
-            convert(Array{Float64}, [length(findall((in)(v), data)) for v in unique_data])
-    end
-
     count_vec = zeros(n)
     best = zeros(n)
     last = zeros(Int64, n)
 
-    for K = 1:n
-        widths = block_length[1:K] .- block_length[K+1]
-        count_vec[1:K] .+= nn_vec[K]
+    # Reused across iterations so the O(n^2) DP does not also pay for O(n^2)
+    # bytes of temporary array allocation (one fresh slice/broadcast per K).
+    widths = Vector{Float64}(undef, n)
+    fit_vec = Vector{Float64}(undef, n)
 
-        # Fitness function (eq. 19 from Scargle 2012)
-        fit_vec = count_vec[1:K] .* log.(count_vec[1:K] ./ widths)
+    @inbounds for K = 1:n
+        block_length_K1 = block_length[K+1]
+        for i = 1:K
+            widths[i] = block_length[i] - block_length_K1
+        end
+        for i = 1:K
+            count_vec[i] += nn_vec[K]
+        end
+
         # Prior (eq. 21 from Scargle 2012)
-        fit_vec .-= 4 - log(73.53 * 0.05 * ((K)^-0.478))
-        fit_vec[2:end] += best[1:K-1]
+        prior = 4 - log(73.53 * 0.05 * ((K)^-0.478))
+        # Fitness function (eq. 19 from Scargle 2012)
+        for i = 1:K
+            fit_vec[i] = count_vec[i] * log(count_vec[i] / widths[i]) - prior
+        end
+        for i = 2:K
+            fit_vec[i] += best[i-1]
+        end
 
-        i_max = argmax(fit_vec)
+        i_max = 1
+        best_val = fit_vec[1]
+        for i = 2:K
+            if fit_vec[i] > best_val
+                best_val = fit_vec[i]
+                i_max = i
+            end
+        end
         last[K] = i_max
-        best[K] = fit_vec[i_max]
+        best[K] = best_val
     end
 
     change_points = zeros(Int64, n)
