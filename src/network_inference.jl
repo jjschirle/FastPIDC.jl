@@ -228,7 +228,7 @@ function InferredNetwork(
             if config.verbose
                 println("[FastPIDC] Writing pre-context PUC scores.")
             end
-            dump_puc_scores(scores, nodes, config; mi_scores = mi_scores)
+            dump_puc_scores(scores, nodes, config)
         end
 
         # Apply context if necessary (PIDC = true, PUC = false)

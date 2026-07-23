@@ -198,13 +198,7 @@ To load in Python:
 """
 function write_network_npy(file_path::String, inferred_network::InferredNetwork)
 
-    # Ensure the file path correctly ends in .npy
-    if !endswith(file_path, ".npy")
-        file_path = replace(file_path, r"\.[a-zA-Z0-9]+$" => ".npy")
-        if !endswith(file_path, ".npy")
-            file_path *= ".npy"
-        end
-    end
+    file_path = _npy_output_path(file_path)
 
     # Extract node labels and map them to matrix indices
     labels = [String(node.label) for node in inferred_network.nodes]
@@ -234,13 +228,9 @@ function write_network_npy(file_path::String, inferred_network::InferredNetwork)
     npzwrite(file_path, A)
 
     # Write matching gene list sidecar
-    genes_path = replace(file_path, ".npy" => "_genes.txt")
-    
-    open(genes_path, "w") do io
-        for g in labels
-            println(io, g)
-        end
-    end
+    _write_genes_file(_network_genes_path(file_path), inferred_network.nodes)
+
+    return nothing
 end
 
 """

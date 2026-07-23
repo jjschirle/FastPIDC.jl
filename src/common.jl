@@ -21,10 +21,8 @@ Base.@kwdef struct PIDCConfig
     backend::Symbol = :cuda                     # :cuda (default) or :cpu
     discretizer::String = "bayesian_blocks"     # mirrors existing default
     estimator::String = "maximum_likelihood"    # mirrors existing default
-    dump_mi_path::Union{Nothing,String} = nothing  # If nothing => don't dump
-    dump_mi_fraction::Float64 = 1.0                # 0–1; 1.0 = all pairs
-    dump_puc_path::Union{Nothing,String} = nothing  # If nothing => don't dump
-    dump_puc_fraction::Float64 = 1.0                # 0–1; 1.0 = all pairs
+    dump_mi_path::Union{Nothing,String} = nothing   # Output stem/path; writes *_mi.npy
+    dump_puc_path::Union{Nothing,String} = nothing  # Output stem/path; writes *_puc.npy
     verbose::Bool = false
     # Inner constructor for automatic validation
     function PIDCConfig(
@@ -32,33 +30,60 @@ Base.@kwdef struct PIDCConfig
         discretizer,
         estimator,
         dump_mi_path,
-        dump_mi_fraction,
         dump_puc_path,
-        dump_puc_fraction,
         verbose,
     )
 
         if !(backend in (:cpu, :cuda))
             throw(ArgumentError("backend must be :cpu or :cuda, got :$backend"))
         end
-        if !(0.0 <= dump_mi_fraction <= 1.0)
-            throw(ArgumentError("dump_mi_fraction must be between 0.0 and 1.0"))
-        end
-        if !(0.0 <= dump_puc_fraction <= 1.0)
-            throw(ArgumentError("dump_puc_fraction must be between 0.0 and 1.0"))
-        end
-
         new(
             backend,
             discretizer,
             estimator,
             dump_mi_path,
-            dump_mi_fraction,
             dump_puc_path,
-            dump_puc_fraction,
             verbose,
         )
     end
+end
+
+# NumPy output helpers
+
+function _npy_output_path(file_path::AbstractString)
+    stem, _ = splitext(String(file_path))
+    return stem * ".npy"
+end
+
+function _score_output_path(file_path::AbstractString, score_name::Symbol)
+    score_name in (:mi, :puc) ||
+        throw(ArgumentError("score_name must be :mi or :puc, got :$score_name"))
+
+    npy_path = _npy_output_path(file_path)
+    stem, _ = splitext(npy_path)
+    suffix = "_$(score_name)"
+    return endswith(stem, suffix) ? npy_path : stem * suffix * ".npy"
+end
+
+function _network_genes_path(file_path::AbstractString)
+    stem, _ = splitext(_npy_output_path(file_path))
+    return stem * "_genes.txt"
+end
+
+function _score_genes_path(file_path::AbstractString, score_name::Symbol)
+    score_path = _score_output_path(file_path, score_name)
+    stem, _ = splitext(score_path)
+    suffix = "_$(score_name)"
+    return chop(stem; tail = length(suffix)) * "_genes.txt"
+end
+
+function _write_genes_file(file_path::AbstractString, nodes)
+    open(file_path, "w") do io
+        for node in nodes
+            println(io, String(node.label))
+        end
+    end
+    return nothing
 end
 
 
