@@ -7,6 +7,7 @@ using DelimitedFiles
 using SharedArrays
 using SparseArrays
 using NPZ
+using HDF5
 
 export
     # Common types
