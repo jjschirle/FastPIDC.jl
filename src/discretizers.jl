@@ -206,39 +206,40 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
     edges[end] = unique_data[end]
     block_length = unique_data[end] .- edges
 
-    count_vec = zeros(n)
     best = zeros(n)
     last = zeros(Int64, n)
 
-    # Reused across iterations so the O(n^2) DP does not also pay for O(n^2)
-    # bytes of temporary array allocation (one fresh slice/broadcast per K).
-    widths = Vector{Float64}(undef, n)
-    fit_vec = Vector{Float64}(undef, n)
+    # Prefix counts let each candidate block count be recovered in O(1),
+    # avoiding the repeated count-vector update and extra full-prefix passes.
+    # Multiplicities and their cumulative sums are integer-valued Float64s, so
+    # the resulting counts are bit-exact while the legacy fitness expression
+    # and first-maximum tie-breaking order remain unchanged.
+    prefix_counts = cumsum(nn_vec)
 
     @inbounds for K = 1:n
         block_length_K1 = block_length[K+1]
-        for i = 1:K
-            widths[i] = block_length[i] - block_length_K1
-        end
-        for i = 1:K
-            count_vec[i] += nn_vec[K]
-        end
 
         # Prior (eq. 21 from Scargle 2012)
         prior = 4 - log(73.53 * 0.05 * ((K)^-0.478))
-        # Fitness function (eq. 19 from Scargle 2012)
-        for i = 1:K
-            fit_vec[i] = count_vec[i] * log(count_vec[i] / widths[i]) - prior
-        end
-        for i = 2:K
-            fit_vec[i] += best[i-1]
-        end
 
+        # Initialize from the first candidate exactly as the legacy loop did,
+        # then scan the remaining candidates in the same order and retain the
+        # first maximum on ties.
+        count = prefix_counts[K]
+        width = block_length[1] - block_length_K1
+        best_val = count * log(count / width) - prior
         i_max = 1
-        best_val = fit_vec[1]
+
         for i = 2:K
-            if fit_vec[i] > best_val
-                best_val = fit_vec[i]
+            count = prefix_counts[K] - prefix_counts[i-1]
+            width = block_length[i] - block_length_K1
+
+            # Fitness function (eq. 19 from Scargle 2012)
+            fit = count * log(count / width) - prior
+            fit += best[i-1]
+
+            if fit > best_val
+                best_val = fit
                 i_max = i
             end
         end
