@@ -17,13 +17,16 @@ function joint_counts_kernel_chunked!(data, counts, n, m, k_bins, z_start, z_chu
     z_global = z_start + z_local - 1
     if z_global > n || x == z_global; return nothing; end
     
-    # Each thread computes joint counts for pair (x, z_global)
+    # Each thread computes joint counts for pair (x, z_global). Derive the
+    # increment from the count buffer so UInt16/UInt32 storage remains generic.
+    count_increment = one(eltype(counts))
     for s in 1:m
-        u = data[s, x]
-        v = data[s, z_global]
+        # Bin IDs may use a compact unsigned storage type on the GPU; widen
+        # them for bounds checks and native N-D indexing.
+        u = Int32(data[s, x])
+        v = Int32(data[s, z_global])
         if u >= 1 && u <= k_bins && v >= 1 && v <= k_bins
-            # Using native N-D indexing
-            counts[u, v, x, z_local] += Int32(1)
+            counts[u, v, x, z_local] += count_increment
         end
     end
 
@@ -114,67 +117,109 @@ end
 
 # --- Host Implementation ---
 
-function FastPIDC.compute_puc_full_cuda(nodes, config, base)
+function _smallest_unsigned_type(max_value::Integer)
+    max_value >= 0 || throw(ArgumentError("max_value must be nonnegative"))
+
+    if max_value <= 255
+        return UInt8
+    elseif max_value <= 65_535
+        return UInt16
+    elseif max_value <= 4_294_967_295
+        return UInt32
+    else
+        return UInt64
+    end
+end
+
+function _compute_puc_full_cuda_typed(
+    nodes,
+    config,
+    base,
+    ::Type{BinT},
+    ::Type{CountT},
+) where {BinT<:Integer,CountT<:Integer}
     num_nodes = length(nodes)
     num_samples = length(nodes[1].binned_values)
     k_bins = maximum(n -> n.number_of_bins, nodes)
-    
-    # Chunk configuration (512 genes at a time)
-    chunk_size = 256 
-    
-    # Prepare static data on CPU and move to GPU
-    data_cpu = zeros(Int32, num_samples, num_nodes)
+
+    # Process 256 target genes at a time
+    chunk_size = 256
+
+    # Prepare static data on CPU and move to GPU.
+    data_cpu = Matrix{BinT}(undef, num_samples, num_nodes)
     marginals_cpu = zeros(Float64, k_bins, num_nodes)
     for i = 1:num_nodes
-        data_cpu[:, i] .= Int32.(nodes[i].binned_values)
+        data_cpu[:, i] .= nodes[i].binned_values
         p = nodes[i].probabilities
         marginals_cpu[1:length(p), i] .= Float64.(p)
     end
 
     data_gpu = CuArray(data_cpu)
     marginals_gpu = CuArray(marginals_cpu)
-    
-    # Global output matrices
+
+    # Global output matrices.
     puc_scores_gpu = CUDA.zeros(Float64, num_nodes, num_nodes)
     mi_matrix_gpu = CUDA.zeros(Float64, num_nodes, num_nodes)
-    
-    # Chunked intermediate buffers (Pre-allocated once!)
-    counts_chunk_gpu = CUDA.zeros(Int32, k_bins, k_bins, num_nodes, chunk_size)
+
+    # Chunked intermediate buffers, pre-allocated once.
+    counts_chunk_gpu = CUDA.zeros(CountT, k_bins, k_bins, num_nodes, chunk_size)
     si_chunk_gpu = CUDA.zeros(Float64, k_bins, num_nodes, chunk_size)
-    
+
     if config.verbose
         println("[FastPIDC] GPU Chunked PUC: Processing $num_nodes x $num_nodes pairs...")
-        println("[FastPIDC] Using chunk size of $chunk_size (approx. $(ceil(Int, num_nodes/chunk_size)) iterations)")
+        println(
+            "[FastPIDC] Using chunk size of $chunk_size " *
+            "(approx. $(ceil(Int, num_nodes / chunk_size)) iterations)",
+        )
+        println(
+            "[FastPIDC] GPU storage types: bin IDs=$(BinT) (max bins=$k_bins), " *
+            "joint counts=$(CountT) (cells=$num_samples)",
+        )
     end
-    
+
     # Iterate over the Z-axis in chunks
     for z_start in 1:chunk_size:num_nodes
         z_end = min(z_start + chunk_size - 1, num_nodes)
         z_curr_chunk_size = z_end - z_start + 1
-        
-        # Wipe the intermediate buffers clean before the next chunk!
-        CUDA.fill!(counts_chunk_gpu, Int32(0))
-        CUDA.fill!(si_chunk_gpu, Float64(0))
-        
+
+        # Wipe the intermediate buffers clean before the next chunk.
+        CUDA.fill!(counts_chunk_gpu, zero(CountT))
+        CUDA.fill!(si_chunk_gpu, 0.0)
+
         threads = (16, 16)
         blocks = (cld(num_nodes, 16), cld(z_curr_chunk_size, 16))
-        
+
         @cuda threads=threads blocks=blocks joint_counts_kernel_chunked!(
-            data_gpu, counts_chunk_gpu,
-            Int32(num_nodes), Int32(num_samples), Int32(k_bins), 
-            Int32(z_start), Int32(z_curr_chunk_size)
+            data_gpu,
+            counts_chunk_gpu,
+            Int32(num_nodes),
+            Int32(num_samples),
+            Int32(k_bins),
+            Int32(z_start),
+            Int32(z_curr_chunk_size),
         )
-        
+
         @cuda threads=threads blocks=blocks mi_si_kernel_chunked!(
-            counts_chunk_gpu, marginals_gpu, mi_matrix_gpu, si_chunk_gpu,
-            Int32(num_nodes), Int32(num_samples), Int32(k_bins), 
-            Int32(z_start), Int32(z_curr_chunk_size)
+            counts_chunk_gpu,
+            marginals_gpu,
+            mi_matrix_gpu,
+            si_chunk_gpu,
+            Int32(num_nodes),
+            Int32(num_samples),
+            Int32(k_bins),
+            Int32(z_start),
+            Int32(z_curr_chunk_size),
         )
-        
+
         @cuda threads=threads blocks=blocks puc_accumulation_kernel_chunked!(
-            si_chunk_gpu, mi_matrix_gpu, puc_scores_gpu, marginals_gpu,
-            Int32(num_nodes), Int32(k_bins), 
-            Int32(z_start), Int32(z_curr_chunk_size)
+            si_chunk_gpu,
+            mi_matrix_gpu,
+            puc_scores_gpu,
+            marginals_gpu,
+            Int32(num_nodes),
+            Int32(k_bins),
+            Int32(z_start),
+            Int32(z_curr_chunk_size),
         )
     end
     # Copy results back
@@ -191,6 +236,21 @@ function FastPIDC.compute_puc_full_cuda(nodes, config, base)
     end
 
     return mi_matrix_cpu, puc_scores_cpu
+end
+
+function FastPIDC.compute_puc_full_cuda(nodes, config, base)
+    num_samples = length(nodes[1].binned_values)
+    k_bins = maximum(n -> n.number_of_bins, nodes)
+
+    # Bin IDs only need to represent the largest per-gene bin index.
+    BinT = _smallest_unsigned_type(k_bins)
+
+    # A joint count can reach the total number of cells. Choose the smallest
+    # exact unsigned type that can hold num_samples, guarding against overflow
+    # as datasets with larger cell counts are processed.
+    CountT = _smallest_unsigned_type(num_samples)
+
+    return _compute_puc_full_cuda_typed(nodes, config, base, BinT, CountT)
 end
 
 end # module

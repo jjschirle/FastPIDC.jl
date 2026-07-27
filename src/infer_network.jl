@@ -68,30 +68,28 @@ function get_nodes_h5(
                 read(data_obj["indices"]) .+ 1, 
                 read(data_obj["data"])
             )
-            number_of_cells = size(X_raw, 1)
             
         elseif isa(data_obj, HDF5.Dataset)
             # Python saved (Cells, Genes) C-Order. Julia reads (Genes, Cells).
             # We permute dimensions to make it (Cells, Genes) so our slicing logic is uniform.
             X_raw = permutedims(read(data_obj))
-            number_of_cells = size(X_raw, 1)
         else
             throw(ArgumentError("Object at '$matrix_key' is neither an HDF5 Group nor a Dataset."))
         end
         
-        # Build the Nodes
+        # Build Nodes directly from typed HDF5 columns. The dedicated
+        # constructor avoids allocating a mixed-type Matrix{Any} for each gene.
         nodes = Array{Node}(undef, number_of_nodes)
         Threads.@threads for i = 1:number_of_nodes
-            label = gene_names[i]
-            
-            # Since X_raw is (Cells, Genes), Column `i` is Gene `i`
-            data_gene = @view X_raw[:, i] 
-            
-            legacy_format = Matrix{Any}(undef, 1, number_of_cells + 1)
-            legacy_format[1, 1] = label
-            legacy_format[1, 2:end] .= data_gene
-            
-            nodes[i] = Node(legacy_format, discretizer, estimator, number_of_bins)
+            # Since X_raw is (Cells, Genes), column `i` is gene `i`.
+            data_gene = @view X_raw[:, i]
+            nodes[i] = Node(
+                gene_names[i],
+                data_gene,
+                discretizer,
+                estimator,
+                number_of_bins,
+            )
         end
     end
     

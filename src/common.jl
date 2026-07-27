@@ -48,7 +48,7 @@ Base.@kwdef struct PIDCConfig
     end
 end
 
-# NumPy output helpers
+# --- NumPy output helpers -----------------------------------------
 
 function _npy_output_path(file_path::AbstractString)
     stem, _ = splitext(String(file_path))
@@ -87,28 +87,50 @@ function _write_genes_file(file_path::AbstractString, nodes)
 end
 
 
-# Constructs a Node from a line of a data file. line should be an array with
-# the label as the first element, then the raw data values.
-function Node(line::AbstractArray, discretizer, estimator, number_of_bins)
+"""
+    Node(label::AbstractString, raw_values::AbstractVector{<:Real},
+         discretizer, estimator, number_of_bins)
 
-    label = string(line[1])
-    raw_values = Array{Float64}(line[2:end])
+Construct a `Node` directly from a label and typed numeric values. This path
+avoids materializing the legacy mixed-type `Matrix{Any}` row when loading HDF5
+columns, reducing allocation and type instability without changing the
+underlying discretization or probability calculations.
+"""
+function Node(
+    label::AbstractString,
+    raw_values::AbstractVector{<:Real},
+    discretizer,
+    estimator,
+    number_of_bins,
+)
+    values = collect(Float64, raw_values)
 
-    # Raw values are mapped to their bin IDs
-    binned_values = zeros(Int, length(raw_values))
+    # Raw values are mapped to their bin IDs.
+    binned_values = zeros(Int, length(values))
 
     # If the discretizer is Bayesian blocks, number_of_bins will be
     # overwritten by the ideal number of bins. Otherwise, it will remain
     # the same as the value passed in.
-    number_of_bins = get_bin_ids!(raw_values, discretizer, number_of_bins, binned_values)
+    number_of_bins = get_bin_ids!(values, discretizer, number_of_bins, binned_values)
 
     probabilities = get_probabilities(
         estimator,
         get_frequencies_from_bin_ids(binned_values, number_of_bins),
     )
 
-    return Node(label, binned_values, number_of_bins, probabilities)
+    return Node(String(label), binned_values, number_of_bins, probabilities)
+end
 
+# Constructs a Node from the legacy mixed-type row format: the label is the
+# first element and all remaining elements are raw numeric values.
+function Node(line::AbstractArray, discretizer, estimator, number_of_bins)
+    return Node(
+        string(line[1]),
+        collect(Float64, line[2:end]),
+        discretizer,
+        estimator,
+        number_of_bins,
+    )
 end
 
 
