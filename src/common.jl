@@ -18,7 +18,8 @@ end
 
 # --- PIDC configuration -------------------------------------------
 Base.@kwdef struct PIDCConfig
-    backend::Symbol = :cuda                     # :cuda (default) or :cpu
+    backend::Symbol = :cuda                     # PUC backend: :cuda or :cpu
+    bb_backend::Symbol = :cuda                  # Bayesian blocks backend: :cuda or :cpu
     discretizer::String = "bayesian_blocks"     # mirrors existing default
     estimator::String = "maximum_likelihood"    # mirrors existing default
     dump_mi_path::Union{Nothing,String} = nothing   # Output stem/path; writes *_mi.npy
@@ -27,6 +28,7 @@ Base.@kwdef struct PIDCConfig
     # Inner constructor for automatic validation
     function PIDCConfig(
         backend,
+        bb_backend,
         discretizer,
         estimator,
         dump_mi_path,
@@ -37,8 +39,12 @@ Base.@kwdef struct PIDCConfig
         if !(backend in (:cpu, :cuda))
             throw(ArgumentError("backend must be :cpu or :cuda, got :$backend"))
         end
+        if !(bb_backend in (:cpu, :cuda))
+            throw(ArgumentError("bb_backend must be :cpu or :cuda, got :$bb_backend"))
+        end
         new(
             backend,
+            bb_backend,
             discretizer,
             estimator,
             dump_mi_path,

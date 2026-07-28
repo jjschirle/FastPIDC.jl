@@ -172,13 +172,46 @@ end
 
 struct DiscretizeBayesianBlocks <: DiscretizationAlgorithm end
 
-function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {N<:AbstractFloat}
+"""
+    BayesianBlocksProblem
 
+CPU-prepared inputs for the Bayesian-block dynamic program. Preparation is
+shared by the CPU and CUDA backends so backend comparisons isolate the dynamic
+program itself rather than sorting or unique-value compression.
+"""
+struct BayesianBlocksProblem
+    edges::Vector{Float64}
+    prefix_counts::Vector{Float64}
+end
+
+"""
+    BayesianBlocksSolution
+
+Selected change-point indices and the final dynamic-program objective value.
+The change points index `BayesianBlocksProblem.edges`.
+"""
+struct BayesianBlocksSolution
+    change_points::Vector{Int64}
+    score::Float64
+end
+
+# Placeholders extended by FastPIDCCUDAExt when CUDA.jl is loaded.
+function bayesian_blocks_cuda_available end
+function solve_bayesian_blocks_cuda end
+
+"""
+    prepare_bayesian_blocks(data)
+
+Sort one gene's observations, collapse repeated values, and prepare the shared
+prefix-count representation used by both Bayesian-block backends.
+"""
+function prepare_bayesian_blocks(data::AbstractArray{N}) where {N<:AbstractFloat}
     # Single sorted pass to get unique values together with their multiplicities,
     # rather than sorting/uniquing separately and then re-scanning the full
     # data array once per unique value (which is O(n_unique * length(data))).
     sorted_data = sort(vec(data))
     m = length(sorted_data)
+    m > 0 || throw(ArgumentError("Bayesian blocks requires at least one observation"))
 
     unique_data = Vector{Float64}(undef, m)
     nn_vec = Vector{Float64}(undef, m)
@@ -198,15 +231,41 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
     resize!(unique_data, n)
     resize!(nn_vec, n)
 
-    edges = zeros(n + 1)
+    edges = zeros(Float64, n + 1)
     edges[1] = unique_data[1]
     for i = 1:(n-1)
         edges[i+1] = 0.5 * (unique_data[i] + unique_data[i+1])
     end
     edges[end] = unique_data[end]
-    block_length = unique_data[end] .- edges
 
-    best = zeros(n)
+    prefix_counts = cumsum(nn_vec)
+    return BayesianBlocksProblem(edges, prefix_counts)
+end
+
+function prepare_bayesian_blocks(data::AbstractArray{N}) where {N<:Integer}
+    return prepare_bayesian_blocks(convert(Array{Float64}, data))
+end
+
+"""
+    solve_bayesian_blocks_cpu(problem)
+
+Solve one prepared Bayesian-block problem with the exact prefix-count CPU
+dynamic program. This remains the reference implementation for CUDA
+conformance testing.
+"""
+function solve_bayesian_blocks_cpu(problem::BayesianBlocksProblem)
+    prefix_counts = problem.prefix_counts
+    # Block lengths are derived from retained edges only when the CPU solver
+    # needs them, avoiding a second U_g-sized Float64 vector per gene while
+    # CUDA batches are being prepared.
+    block_length = problem.edges[end] .- problem.edges
+    n = length(prefix_counts)
+
+    if n == 1
+        return BayesianBlocksSolution(Int64[1, 2], 0.0)
+    end
+
+    best = zeros(Float64, n)
     last = zeros(Int64, n)
 
     # Prefix counts let each candidate block count be recovered in O(1),
@@ -214,8 +273,6 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
     # Multiplicities and their cumulative sums are integer-valued Float64s, so
     # the resulting counts are bit-exact while the legacy fitness expression
     # and first-maximum tie-breaking order remain unchanged.
-    prefix_counts = cumsum(nn_vec)
-
     @inbounds for K = 1:n
         block_length_K1 = block_length[K+1]
 
@@ -247,8 +304,11 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
         best[K] = best_val
     end
 
-    change_points = zeros(Int64, n)
-    i_cp = n + 1
+    # The maximal partition has one block per unique value and therefore
+    # contains n + 1 edge indices. Reserve that full path length so valid
+    # all-singleton partitions cannot underflow the backtracking buffer.
+    change_points = zeros(Int64, n + 1)
+    i_cp = n + 2
     ind = n + 1
     while true
         i_cp -= 1
@@ -259,10 +319,18 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
         ind = last[ind-1]
     end
     change_points = change_points[i_cp:end]
-    edges[change_points]
-
+    return BayesianBlocksSolution(change_points, best[end])
 end
+
+function binedges(
+    alg::DiscretizeBayesianBlocks,
+    data::AbstractArray{N},
+) where {N<:AbstractFloat}
+    problem = prepare_bayesian_blocks(data)
+    solution = solve_bayesian_blocks_cpu(problem)
+    return problem.edges[solution.change_points]
+end
+
 function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {N<:Integer}
-    data = convert(Array{Float64}, data)
-    return binedges(alg, data)
+    return binedges(alg, convert(Array{Float64}, data))
 end

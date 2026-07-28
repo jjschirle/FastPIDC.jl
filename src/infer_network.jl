@@ -1,5 +1,219 @@
 # Helper functions for inferring a network from a data file
 
+function _validate_bb_backend(bb_backend::Symbol)
+    bb_backend in (:cpu, :cuda) ||
+        throw(ArgumentError("bb_backend must be :cpu or :cuda, got :$bb_backend"))
+    return bb_backend
+end
+
+
+function _bayesian_blocks_cuda_available()
+    return hasmethod(bayesian_blocks_cuda_available, Tuple{}) &&
+           bayesian_blocks_cuda_available()
+end
+
+function _solve_bayesian_blocks_batch(
+    problems::Vector{BayesianBlocksProblem};
+    bb_backend::Symbol,
+    verbose::Bool,
+)
+    _validate_bb_backend(bb_backend)
+    isempty(problems) && return BayesianBlocksSolution[]
+
+    if bb_backend == :cuda
+        if _bayesian_blocks_cuda_available() &&
+           hasmethod(solve_bayesian_blocks_cuda, (typeof(problems), Bool))
+            solutions = solve_bayesian_blocks_cuda(problems, verbose)
+            solutions !== nothing && return solutions
+        end
+
+        @warn "CUDA Bayesian blocks requested, but no functional CUDA GPU was found. Falling back to the CPU reference implementation."
+    end
+
+    solutions = Vector{BayesianBlocksSolution}(undef, length(problems))
+    Threads.@threads for i = eachindex(problems)
+        solutions[i] = solve_bayesian_blocks_cpu(problems[i])
+    end
+    return solutions
+end
+
+function _node_from_bayesian_solution(
+    label::AbstractString,
+    values::Vector{Float64},
+    problem::BayesianBlocksProblem,
+    solution::BayesianBlocksSolution,
+    estimator,
+)
+    edges = problem.edges[solution.change_points]
+    binned_values = encode(LinearDiscretizer(edges), values)
+    number_of_bins = length(edges) - 1
+    probabilities = get_probabilities(
+        estimator,
+        get_frequencies_from_bin_ids(binned_values, number_of_bins),
+    )
+    return Node(String(label), binned_values, number_of_bins, probabilities)
+end
+
+"""
+    _build_nodes(labels, value_at; ...)
+
+Construct nodes from a callable returning one gene's observations. Bayesian
+blocks are prepared once on the CPU, then solved as a batch by the selected
+backend. Quantization or other input transformations remain upstream of
+FastPIDC; this function operates on the values exactly as supplied.
+"""
+function _build_nodes(
+    labels::AbstractVector,
+    value_at;
+    discretizer,
+    estimator,
+    number_of_bins,
+    bb_backend::Symbol,
+    verbose::Bool,
+)
+    number_of_nodes = length(labels)
+    _validate_bb_backend(bb_backend)
+
+    if discretizer == "bayesian_blocks" && bb_backend == :cuda &&
+       !_bayesian_blocks_cuda_available()
+        @warn "CUDA Bayesian blocks requested, but no functional CUDA GPU was found. Falling back to the CPU reference implementation."
+        bb_backend = :cpu
+    end
+
+    if discretizer != "bayesian_blocks" || bb_backend == :cpu
+        # Keep the CPU reference on the original per-gene construction path.
+        # This avoids retaining every gene's prepared unique-value arrays in
+        # memory when batching is unnecessary.
+        nodes = Array{Node}(undef, number_of_nodes)
+        Threads.@threads for i = 1:number_of_nodes
+            nodes[i] = Node(
+                string(labels[i]),
+                collect(Float64, vec(value_at(i))),
+                discretizer,
+                estimator,
+                number_of_bins,
+            )
+        end
+        return nodes
+    end
+
+    preparation_start_ns = time_ns()
+
+    # Sorting and unique-value compression are shared by the CPU and CUDA
+    # solvers. The resulting U_g values are also all the CUDA backend needs to
+    # form lightweight workload buckets; no extra scan of the expression data
+    # is required for bucket selection.
+    problems = Vector{Union{Nothing,BayesianBlocksProblem}}(undef, number_of_nodes)
+    fallback = zeros(UInt8, number_of_nodes)
+    Threads.@threads for i = 1:number_of_nodes
+        values = collect(Float64, vec(value_at(i)))
+        try
+            problems[i] = prepare_bayesian_blocks(values)
+        catch
+            problems[i] = nothing
+            fallback[i] = 1
+        end
+    end
+
+    preparation_seconds = (time_ns() - preparation_start_ns) / 1.0e9
+    if verbose
+        unique_counts = sort!([
+            problem === nothing ? 0 : length(problem.prefix_counts) for problem in problems
+        ])
+        nonzero_counts = [u for u in unique_counts if u != 0]
+        if !isempty(nonzero_counts)
+            percentile_index(p) = clamp(ceil(Int, p * length(nonzero_counts)), 1, length(nonzero_counts))
+            candidate_work = UInt128(0)
+            for u in nonzero_counts
+                candidate_work += UInt128(u) * UInt128(u + 1) ÷ UInt128(2)
+            end
+            println(
+                "[FastPIDC] Bayesian-block preparation: " *
+                "$(round(preparation_seconds; digits = 2)) s",
+            )
+            println(
+                "[FastPIDC] Bayesian-block U_g: min=$(first(nonzero_counts)), " *
+                "median=$(nonzero_counts[percentile_index(0.50)]), " *
+                "p90=$(nonzero_counts[percentile_index(0.90)]), " *
+                "p99=$(nonzero_counts[percentile_index(0.99)]), " *
+                "max=$(last(nonzero_counts)); candidate evaluations=$candidate_work",
+            )
+        end
+    end
+
+    active_indices = Int[]
+    active_problems = BayesianBlocksProblem[]
+    for i = 1:number_of_nodes
+        problem = problems[i]
+        if fallback[i] == 0 && problem !== nothing && length(problem.prefix_counts) > 1
+            push!(active_indices, i)
+            push!(active_problems, problem)
+        end
+    end
+
+    solve_start_ns = time_ns()
+    active_solutions = _solve_bayesian_blocks_batch(
+        active_problems;
+        bb_backend = bb_backend,
+        verbose = verbose,
+    )
+    solve_seconds = (time_ns() - solve_start_ns) / 1.0e9
+    verbose && println(
+        "[FastPIDC] Bayesian-block dynamic program ($bb_backend): " *
+        "$(round(solve_seconds; digits = 2)) s",
+    )
+
+    solutions = Vector{Union{Nothing,BayesianBlocksSolution}}(undef, number_of_nodes)
+    fill!(solutions, nothing)
+    for (i, solution) in zip(active_indices, active_solutions)
+        solutions[i] = solution
+    end
+    empty!(active_problems)
+
+    encoding_start_ns = time_ns()
+    nodes = Array{Node}(undef, number_of_nodes)
+    Threads.@threads for i = 1:number_of_nodes
+        values = collect(Float64, vec(value_at(i)))
+        problem = problems[i]
+        solution = solutions[i]
+
+        if fallback[i] != 0 || problem === nothing
+            nodes[i] = Node(
+                string(labels[i]),
+                values,
+                "uniform_width",
+                estimator,
+                number_of_bins,
+            )
+            println("Bayesian blocks failed for $(labels[i]), fell back to uniform width")
+        elseif length(problem.prefix_counts) == 1
+            binned_values = ones(Int, length(values))
+            probabilities = get_probabilities(
+                estimator,
+                get_frequencies_from_bin_ids(binned_values, 1),
+            )
+            nodes[i] = Node(String(labels[i]), binned_values, 1, probabilities)
+        else
+            nodes[i] = _node_from_bayesian_solution(
+                string(labels[i]),
+                values,
+                problem,
+                solution::BayesianBlocksSolution,
+                estimator,
+            )
+        end
+        problems[i] = nothing
+    end
+
+    encoding_seconds = (time_ns() - encoding_start_ns) / 1.0e9
+    verbose && println(
+        "[FastPIDC] Bayesian-block bin encoding: " *
+        "$(round(encoding_seconds; digits = 2)) s",
+    )
+
+    return nodes
+end
+
 # Entry point: checks extension and routes to the right loader
 function get_nodes(
     data_file_path::String;
@@ -7,11 +221,28 @@ function get_nodes(
     discretizer = "bayesian_blocks",
     estimator = "maximum_likelihood",
     number_of_bins = 10,
+    bb_backend::Symbol = :cuda,
+    verbose::Bool = false,
 )
     if endswith(data_file_path, ".h5")
-        return get_nodes_h5(data_file_path; discretizer, estimator, number_of_bins)
+        return get_nodes_h5(
+            data_file_path;
+            discretizer,
+            estimator,
+            number_of_bins,
+            bb_backend,
+            verbose,
+        )
     else
-        return get_nodes_text(data_file_path; delim, discretizer, estimator, number_of_bins)
+        return get_nodes_text(
+            data_file_path;
+            delim,
+            discretizer,
+            estimator,
+            number_of_bins,
+            bb_backend,
+            verbose,
+        )
     end
 end
 
@@ -21,6 +252,8 @@ function get_nodes_h5(
     discretizer = "bayesian_blocks",
     estimator = "maximum_likelihood",
     number_of_bins = 10,
+    bb_backend::Symbol = :cuda,
+    verbose::Bool = false,
 )
     nodes = Node[]
     
@@ -77,20 +310,17 @@ function get_nodes_h5(
             throw(ArgumentError("Object at '$matrix_key' is neither an HDF5 Group nor a Dataset."))
         end
         
-        # Build Nodes directly from typed HDF5 columns. The dedicated
-        # constructor avoids allocating a mixed-type Matrix{Any} for each gene.
-        nodes = Array{Node}(undef, number_of_nodes)
-        Threads.@threads for i = 1:number_of_nodes
-            # Since X_raw is (Cells, Genes), column `i` is gene `i`.
-            data_gene = @view X_raw[:, i]
-            nodes[i] = Node(
-                gene_names[i],
-                data_gene,
-                discretizer,
-                estimator,
-                number_of_bins,
-            )
-        end
+        # Since X_raw is (Cells, Genes), column `i` is gene `i`.
+        value_at = i -> (@view X_raw[:, i])
+        nodes = _build_nodes(
+            gene_names,
+            value_at;
+            discretizer,
+            estimator,
+            number_of_bins,
+            bb_backend,
+            verbose,
+        )
     end
     
     return nodes
@@ -115,6 +345,8 @@ Arguments:
 * `discretizer="bayesian_blocks"`: algorithm for discretizing the data
 * `estimator="maximum_likelihood"`: algorithm for estimating probabilities
 * `number_of_bins=10`: will be overwritten if using "bayesian_blocks"
+* `bb_backend=:cuda`: Bayesian-block dynamic-program backend (`:cuda` or `:cpu`)
+* `verbose=false`: print Bayesian-block phase, workload, and bucket diagnostics
 
 The "maximum_likelihood" estimator is recommended for PUC and PIDC.
 """
@@ -124,6 +356,8 @@ function get_nodes_text(
     discretizer = "bayesian_blocks",
     estimator = "maximum_likelihood",
     number_of_bins = 10,
+    bb_backend::Symbol = :cuda,
+    verbose::Bool = false,
 )
     lines = open(data_file_path) do io
         if delim == false
@@ -133,15 +367,17 @@ function get_nodes_text(
         end
     end
     
-    number_of_nodes = size(lines, 1)
-    nodes = Array{Node}(undef, number_of_nodes)
-
-    Threads.@threads for i = 1:number_of_nodes
-        # Note: lines[i:i, 1:end] is a memory trap; it allocates a new matrix for every gene.
-        nodes[i] = Node(lines[i:i, 1:end], discretizer, estimator, number_of_bins)
-    end
-
-    return nodes
+    labels = string.(lines[:, 1])
+    value_at = i -> (@view lines[i, 2:end])
+    return _build_nodes(
+        labels,
+        value_at;
+        discretizer,
+        estimator,
+        number_of_bins,
+        bb_backend,
+        verbose,
+    )
 end
 
 
@@ -324,6 +560,7 @@ Arguments:
 * `discretizer="bayesian_blocks"`: algorithm for discretizing the data
 * `estimator="maximum_likelihood"`: algorithm for estimating probabilities
 * `number_of_bins=10`: will be overwritten if using "bayesian_blocks"
+* `config.bb_backend`: Bayesian-block backend used while constructing nodes
 * `base=2`: base for the information measures
 * `out_file_path=""`: path to output file. If empty, will not write a file
 
@@ -349,6 +586,8 @@ function infer_network(
         discretizer = discretizer,
         estimator = estimator,
         number_of_bins = number_of_bins,
+        bb_backend = config.bb_backend,
+        verbose = config.verbose,
     )
 
     println("Inferring network...")
