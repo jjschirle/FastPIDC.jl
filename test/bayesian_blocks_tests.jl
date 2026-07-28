@@ -146,3 +146,10 @@ end
     @test typed_node.probabilities == legacy_node.probabilities
     @test float_bits(typed_node.probabilities) == float_bits(legacy_node.probabilities)
 end
+
+
+@testset "Bayesian blocks backend configuration" begin
+    @test PIDCConfig().bb_backend == :cuda
+    @test PIDCConfig(bb_backend = :cpu).bb_backend == :cpu
+    @test_throws ArgumentError PIDCConfig(bb_backend = :invalid)
+end
