@@ -12,7 +12,6 @@ module FastPIDC
 
 using Distributions
 using Distributed
-using Pkg
 using DelimitedFiles
 using SharedArrays
 using SparseArrays

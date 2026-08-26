@@ -1,5 +1,7 @@
 # NetworkInference
 
+Documentation: https://meyer-lab.github.io/FastPIDC.jl/
+
 ## Description
 
 NetworkInference is a package for inferring (undirected) networks, given a set of measurements for each node. The main output is the `InferredNetwork` type, which represents a fully connected, weighted network, where an edge's weight indicates the relative confidence of that edge existing in the true network. See also [Scope](#scope).

@@ -1,6 +1,5 @@
 using FastPIDC
 using Test
-using LinearAlgebra
 using CUDA
 using Statistics
 const DATA_DIR = joinpath(dirname(@__FILE__), "data")

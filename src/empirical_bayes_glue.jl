@@ -1,8 +1,9 @@
 # Glue functions for natively using EmpiricalBayes with NetworkInference structures.
 # Will not load if EmpiricalBayes does not exist.
 
-# Check for EmpiricalBayes package
-EB_EXISTS = any(x -> x.name == "EmpiricalBayes", values(Pkg.dependencies()))
+# Check for EmpiricalBayes package, without depending on Pkg: this asks Julia's
+# package loader whether "EmpiricalBayes" resolves from the active environment.
+EB_EXISTS = Base.find_package("EmpiricalBayes") !== nothing
 
 # Only load if package exists
 if EB_EXISTS
