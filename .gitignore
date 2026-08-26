@@ -9,3 +9,7 @@
 # macOS
 .DS_Store
 **/.DS_Store
+
+# Documenter build output
+/docs/build/
+/docs/Manifest.toml

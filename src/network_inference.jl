@@ -2,29 +2,69 @@
 # PIDC are explained in http://biorxiv.org/content/early/2017/04/26/082099 - along with terms
 # such as specific information, proportional unique contribution, context, etc.
 
-# Network inference algorithms
+"""
+    AbstractNetworkInference
+
+Supertype for the network inference algorithms: [`MINetworkInference`](@ref),
+[`CLRNetworkInference`](@ref), [`PUCNetworkInference`](@ref) and
+[`PIDCNetworkInference`](@ref). Used to select behavior in
+[`InferredNetwork`](@ref) via the [`apply_context`](@ref) and
+[`get_puc`](@ref) traits.
+"""
 abstract type AbstractNetworkInference end
+
+"Mutual information (MI) network inference: raw pairwise MI as edge weights."
 struct MINetworkInference <: AbstractNetworkInference end
+
+"Context Likelihood of Relatedness (CLR): MI weights with per-node background context applied."
 struct CLRNetworkInference <: AbstractNetworkInference end
+
+"Proportional Unique Contribution (PUC): redundancy-corrected MI, without context."
 struct PUCNetworkInference <: AbstractNetworkInference end
+
+"Partial Information Decomposition and Context (PIDC): PUC scores with per-node background context applied."
 struct PIDCNetworkInference <: AbstractNetworkInference end
 
-# Context trait
+"""
+    apply_context(inference::AbstractNetworkInference) -> Bool
+
+Whether `inference` applies background-context weighting (via
+[`get_weights`](@ref)) to the raw scores. `true` for
+[`CLRNetworkInference`](@ref) and [`PIDCNetworkInference`](@ref).
+"""
 apply_context(::MINetworkInference) = false
 apply_context(::CLRNetworkInference) = true
 apply_context(::PUCNetworkInference) = false
 apply_context(::PIDCNetworkInference) = true
 
-# PUC trait
+"""
+    get_puc(inference::AbstractNetworkInference) -> Bool
+
+Whether `inference` computes PUC (redundancy-corrected) scores rather than
+raw MI. `true` for [`PUCNetworkInference`](@ref) and
+[`PIDCNetworkInference`](@ref).
+"""
 get_puc(::MINetworkInference) = false
 get_puc(::CLRNetworkInference) = false
 get_puc(::PUCNetworkInference) = true
 get_puc(::PIDCNetworkInference) = true
 
-# For sorting the edges
+"""
+    get_weight(edge::Edge) -> Float64
+
+Accessor returning `edge.weight`, used as the sort key when ordering edges
+by confidence.
+"""
 get_weight(edge::Edge) = edge.weight
 
-# Gets the joint probability distribution for two Nodes.
+"""
+    get_joint_probabilities(node1, node2, estimator) -> (probabilities, probabilities1, probabilities2)
+
+Estimate the joint probability distribution `probabilities` for `node1` and
+`node2` (a matrix over their bin ids) using `estimator`, along with the
+marginal distributions `probabilities1` and `probabilities2` recovered by
+summing over the other node's bins.
+"""
 function get_joint_probabilities(node1, node2, estimator)
 
     frequencies = get_frequencies_from_bin_ids(
@@ -47,7 +87,16 @@ function get_joint_probabilities(node1, node2, estimator)
 
 end
 
-# Gets the mutual information between all pairs of Nodes.
+"""
+    get_mi_scores(nodes, number_of_nodes, estimator, base; config=PIDCConfig()) -> SharedMatrix{Float64}
+
+Compute the pairwise mutual information between all `nodes`, returning a
+symmetric `number_of_nodes` by `number_of_nodes` matrix (the diagonal is
+left as zero). `estimator` selects the probability estimator and `base`
+the logarithm base. The computation is distributed across worker
+processes if any are available; `config.verbose` enables progress
+printouts.
+"""
 function get_mi_scores(
     nodes,
     number_of_nodes,
@@ -85,6 +134,16 @@ function get_mi_scores(
 end
 
 
+"""
+    get_puc_scores(nodes, number_of_nodes, estimator, base; config=PIDCConfig()) -> (mi_scores, puc_scores)
+
+Compute the pre-context Proportional Unique Contribution (PUC) scores for
+all pairs of `nodes` (see [`compute_puc_full`](@ref) for the algorithm),
+returning both the pairwise MI matrix `mi_scores` and the PUC score matrix
+`puc_scores`. `estimator` selects the probability estimator, `base` the
+logarithm base, and `config` selects the computation backend (`:cpu` or
+`:cuda`) and enables progress printouts when `config.verbose` is set.
+"""
 function get_puc_scores(
     nodes,
     number_of_nodes,
@@ -100,7 +159,20 @@ function get_puc_scores(
 end
 
 
-# Applies context to the raw edge weights.
+"""
+    get_weights(inference, scores, number_of_nodes, nodes) -> SharedMatrix{Float64}
+
+Apply background-context weighting to raw pairwise `scores` (MI for
+[`CLRNetworkInference`](@ref), PUC for [`PIDCNetworkInference`](@ref)),
+returning a new score matrix of edge weights.
+
+For each node, a background distribution of its scores against all other
+nodes is used to standardize its scores: for [`PIDCNetworkInference`](@ref)
+a Gamma distribution is fit to the background (falling back to a
+CLR-style z-score if the fit fails for either node in a pair), and for
+[`CLRNetworkInference`](@ref) a z-score against the background mean/variance
+is always used. See Chan, Stumpf & Babtie (2017) for details.
+"""
 function get_weights(inference::Union{PIDCNetworkInference, CLRNetworkInference}, scores, number_of_nodes, nodes)
 
     # Pre-allocate parameter storage
@@ -177,6 +249,13 @@ struct InferredNetwork
     edges::Array{Edge}
 end
 
+"""
+    build_sorted_edges(nodes, weights) -> Vector{Edge}
+
+Build an [`Edge`](@ref) for every pair of `nodes`, weighted by the
+corresponding entry of the `weights` matrix, and return them sorted in
+descending order of weight.
+"""
 function build_sorted_edges(nodes, weights)
     number_of_nodes = length(nodes)
     edges = Edge[]
@@ -190,17 +269,28 @@ function build_sorted_edges(nodes, weights)
     return edges
 end
 
-# Constructs an InferredNetwork given a network inference algorithm and an array of
-# Nodes.
-#
-# Keyword arguments:
-# - estimator: algorithm for estimating the probability distribution
-# (The "maximum_likelihood" estimator is recommended for PUC and PIDC, because speedups
-# are made here, based on the assumption that the marginal probability distribution for
-# a node, from the joint distribution with any two other nodes is always the same. If
-# the joint distributions are estimated using other estimators, this assumption is
-# violated for PUC and PIDC in get_puc and get_joint_probabilities.)
-# - base: base for the information measures
+"""
+    InferredNetwork(inference::AbstractNetworkInference, nodes::Array{Node};
+                     estimator="maximum_likelihood", base=2, config=PIDCConfig())
+
+Construct an [`InferredNetwork`](@ref) given a network inference algorithm
+and an array of [`Node`](@ref)s, computing pairwise scores (MI or PUC,
+depending on `inference`), optionally applying context weighting, and
+sorting the resulting edges by descending weight.
+
+# Arguments
+* `inference`: network inference algorithm, e.g. `PIDCNetworkInference()`.
+* `estimator="maximum_likelihood"`: algorithm for estimating the
+  probability distribution. This is recommended for PUC and PIDC, because
+  speedups are made there based on the assumption that the marginal
+  probability distribution for a node, from the joint distribution with
+  any two other nodes, is always the same. Using other estimators violates
+  this assumption for PUC and PIDC (in `get_joint_probabilities` and the
+  PUC computation).
+* `base=2`: base for the information measures.
+* `config=PIDCConfig()`: computation backend and diagnostic-dump settings,
+  used by the PUC/PIDC code path.
+"""
 function InferredNetwork(
     inference::AbstractNetworkInference,
     nodes::Array{Node};

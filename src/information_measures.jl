@@ -8,11 +8,28 @@
 # --- Discretization --------------------------------------------------------
 # (originally InformationMeasures.jl's Discretization.jl)
 
-# Parameters:
-# 	- values_x, array of floats
-# 	- mode, string
-#	- number_of_bins, integer
-#	- bin_ids, 1-dimensional array of bin ids for each value
+"""
+    get_bin_ids!(values_x, mode, number_of_bins, bin_ids) -> Int
+
+Discretize `values_x` in place into `bin_ids` (a pre-allocated array of the
+same length), using discretization method `mode`.
+
+# Arguments
+* `values_x`: array of raw (continuous) data values.
+* `mode`: discretization method — one of `"bayesian_blocks"`,
+  `"uniform_width"`, `"uniform_count"` or `"binarize"`. Falls back to
+  `"uniform_width"` (with a printed message) if `mode` is unrecognized, or
+  if the requested method fails on this data.
+* `number_of_bins`: number of bins to use; ignored (and overwritten in the
+  return value) when `mode == "bayesian_blocks"`, since that method chooses
+  its own bin count.
+* `bin_ids`: pre-allocated output array, filled in place with the bin id of
+  each value in `values_x`.
+
+Returns the actual number of bins used, which differs from `number_of_bins`
+when `mode == "bayesian_blocks"` or when all values in `values_x` are equal
+(in which case a single bin is used).
+"""
 function get_bin_ids!(values_x, mode, number_of_bins, bin_ids)
     min, max = extrema(values_x)
     if min == max
@@ -72,9 +89,12 @@ function get_bin_ids!(values_x, mode, number_of_bins, bin_ids)
     return number_of_bins
 end
 
-# Parameters:
-# 	- bin_ids_x, array of ints
-# 	- number_of_bins_x, number
+"""
+    get_frequencies_from_bin_ids(bin_ids_x, number_of_bins_x) -> Vector{Int}
+
+Count how many values fall into each of `number_of_bins_x` bins, given
+`bin_ids_x`, the bin id assigned to each value.
+"""
 function get_frequencies_from_bin_ids(bin_ids_x, number_of_bins_x)
     n = size(bin_ids_x)[1]
     frequencies = zeros(Int, number_of_bins_x)
@@ -83,6 +103,12 @@ function get_frequencies_from_bin_ids(bin_ids_x, number_of_bins_x)
     end
     return frequencies
 end
+"""
+    get_frequencies_from_bin_ids(bin_ids_x, bin_ids_y, number_of_bins_x, number_of_bins_y) -> Matrix{Int}
+
+Count the joint frequency of each `(bin_ids_x, bin_ids_y)` pair, returning a
+`number_of_bins_x` by `number_of_bins_y` matrix of counts.
+"""
 function get_frequencies_from_bin_ids(
     bin_ids_x,
     bin_ids_y,
@@ -108,23 +134,34 @@ end
 # R implementation of estimators:
 # https://cran.r-project.org/web/packages/entropy/
 
-# Parameters:
-# 	- frequencies, integer array
-# 	- prior, number
+"""
+    get_probabilities_dirichlet(frequencies, prior) -> Array{Float64}
+
+Estimate probabilities from `frequencies` using a Dirichlet estimator with
+concentration `prior` added to every bin before normalizing.
+"""
 function get_probabilities_dirichlet(frequencies, prior)
     prior_frequencies = fill(prior, size(frequencies))
     return (frequencies + prior_frequencies) / (sum(frequencies) + sum(prior_frequencies))
 end
 
-# Parameters:
-# 	- frequencies, integer array
+"""
+    get_probabilities_maximum_likelihood(frequencies) -> Array{Float64}
+
+Estimate probabilities as the simple relative frequencies
+`frequencies / sum(frequencies)`.
+"""
 function get_probabilities_maximum_likelihood(frequencies)
     return frequencies / sum(frequencies)
 end
 
-# Parameters:
-# 	- frequencies, integer array
-# 	- lambda, void
+"""
+    get_probabilities_shrinkage(frequencies, lambda::Nothing) -> Array{Float64}
+
+Estimate probabilities via James-Stein shrinkage towards the uniform
+distribution, estimating the shrinkage intensity automatically (via
+[`get_lambda`](@ref)) since `lambda` is `nothing`.
+"""
 function get_probabilities_shrinkage(frequencies, lambda::Nothing)
     target = get_uniform_distribution(frequencies)
     n = sum(frequencies)
@@ -132,27 +169,55 @@ function get_probabilities_shrinkage(frequencies, lambda::Nothing)
     calculated_lambda = get_lambda(normalized_frequencies, target, n)
     return apply_shrinkage_formula(normalized_frequencies, target, calculated_lambda)
 end
-# Parameters:
-# 	- frequencies, integer array
-# 	- lambda, number
+"""
+    get_probabilities_shrinkage(frequencies, lambda) -> Array{Float64}
+
+Estimate probabilities via James-Stein shrinkage towards the uniform
+distribution, using the fixed shrinkage intensity `lambda`.
+"""
 function get_probabilities_shrinkage(frequencies, lambda)
     target = get_uniform_distribution(frequencies)
     normalized_frequencies = get_normalized_frequencies(frequencies)
     return apply_shrinkage_formula(normalized_frequencies, target, lambda)
 end
 
+"""
+    apply_shrinkage_formula(normalized_frequencies, target, lambda)
+
+Blend `normalized_frequencies` with `target` by shrinkage intensity
+`lambda`: `lambda * target + (1 - lambda) * normalized_frequencies`.
+"""
 function apply_shrinkage_formula(normalized_frequencies, target, lambda)
     return lambda * target .+ (1 - lambda) * normalized_frequencies
 end
 
+"""
+    get_uniform_distribution(frequencies) -> Float64
+
+Probability of a single bin under a uniform distribution over
+`length(frequencies)` bins, i.e. `1 / length(frequencies)`.
+"""
 function get_uniform_distribution(frequencies)
     return 1 / length(frequencies)
 end
 
+"""
+    get_normalized_frequencies(frequencies) -> Array{Float64}
+
+Relative frequencies `frequencies / sum(frequencies)`.
+"""
 function get_normalized_frequencies(frequencies)
     return frequencies / sum(frequencies)
 end
 
+"""
+    get_lambda(normalized_frequencies, target, n) -> Float64
+
+Estimate the James-Stein shrinkage intensity given already-normalized
+frequencies, a `target` distribution, and sample size `n`, following
+Hausser & Strimmer (2009). Returns `1.0` when `n` is `0` or `1`. The result
+is clamped to `[0, 1]`.
+"""
 function get_lambda(normalized_frequencies, target, n)
     if n == 1 || n == 0
         return 1.0
@@ -168,6 +233,13 @@ function get_lambda(normalized_frequencies, target, n)
     return lambda > 1 ? 1.0 : (lambda < 0 ? 0.0 : lambda)
 
 end
+"""
+    get_lambda(frequencies, get_target=get_uniform_distribution) -> Float64
+
+Estimate the James-Stein shrinkage intensity directly from raw
+`frequencies`, computing the target distribution via `get_target` and
+normalizing internally. Returns `1` when the total count is `0` or `1`.
+"""
 function get_lambda(frequencies, get_target = get_uniform_distribution)
     n = sum(frequencies)
     if n == 1 || n == 0
@@ -213,15 +285,25 @@ end
 # Journal of Computational Neuroscience. 36 (2): 119-140.
 # http://link.springer.com/article/10.1007%2Fs10827-013-0458-4
 
+"""
+    remove_non_finite(x)
+
+Return `x` unchanged if finite, otherwise `zero(x)`. Used to silence
+`NaN`/`Inf` contributions (e.g. `0 * log(0)` terms) in information-measure
+sums.
+"""
 function remove_non_finite(x)
     return isfinite(x) ? x : zero(x)
 end
 
-# Parameters:
-# 	- joint probabilities, array of floats
-# 	- probabilities (first variable), array of floats
-# 	- probabilities (second variable), array of floats
-# 	- base, number
+"""
+    apply_mutual_information_formula(p_xy, p_x, p_y, base) -> Float64
+
+Compute the mutual information `sum(p_xy .* log(base, p_xy ./ (p_x .* p_y)))`
+between two variables, given their joint probabilities `p_xy` and marginal
+probabilities `p_x`, `p_y`, using logarithms of base `base`. Non-finite
+terms (arising from zero probabilities) are treated as zero.
+"""
 function apply_mutual_information_formula(
     p_xy::AbstractArray{T},
     p_x::AbstractArray{T},
@@ -231,12 +313,16 @@ function apply_mutual_information_formula(
     return sum(remove_non_finite.(p_xy .* log.(base, p_xy ./ (p_x .* p_y))))
 end
 
-# Parameters:
-# 	- joint probabilities, array of floats
-# 	- probabilities (source), array of floats
-# 	- probabilities (target), array of floats
-# 	- dimension along which to sum, integer
-# 	- base, number
+"""
+    apply_specific_information_formula(p_xz, p_x, p_z, dim_sum, base) -> Vector{Float64}
+
+Compute the specific information of a source variable with respect to a
+target variable, given their joint probabilities `p_xz` and marginals
+`p_x` (source) and `p_z` (target). Summation is performed along dimension
+`dim_sum` of `p_xz` (the source's axis), so the result has one value per
+target bin. Logarithms use base `base`; non-finite terms are treated as
+zero.
+"""
 function apply_specific_information_formula(p_xz, p_x, p_z, dim_sum, base)
     return vec(
         sum(
@@ -246,11 +332,17 @@ function apply_specific_information_formula(p_xz, p_x, p_z, dim_sum, base)
     )
 end
 
-# Parameters:
-# 	- probabilities (target), array of floats
-# 	- specific information of source 1 and target, array of floats
-# 	- specific information of source 2 and target, array of floats
-# 	- base, number
+"""
+    apply_redundancy_formula(p_z, specific_information_1, specific_information_2, base) -> Float64
+
+Compute the redundancy between two source variables with respect to a
+common target, as the expectation (over the target's marginal
+distribution `p_z`) of the minimum of their specific informations
+`specific_information_1` and `specific_information_2`. `base` is accepted
+for a consistent call signature with the other information-measure
+formulae but does not affect the computation (the specific informations
+already encode the logarithm base they were computed with).
+"""
 function apply_redundancy_formula(
     p_z::AbstractArray{T},
     specific_information_1::AbstractArray{T},

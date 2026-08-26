@@ -7,10 +7,22 @@
 
 # --- Generic types -----------------------------------------------------
 
+"""
+    AbstractDiscretizer{N,D}
+
+Supertype for discretizers that encode values of natural type `N` into
+discrete bin ids of type `D`.
+"""
 abstract type AbstractDiscretizer{N,D} end
     # N indicates the decoded, or natural type
     # D indicates the encoded, or discrete type
 
+"""
+    DiscretizationAlgorithm
+
+Supertype for algorithms that compute bin edges for a data array (see
+[`binedges`](@ref)).
+"""
 abstract type DiscretizationAlgorithm end
 
 # --- LinearDiscretizer ---------------------------------------------------
@@ -21,12 +33,30 @@ abstract type DiscretizationAlgorithm end
 
 const DEFAULT_LIN_DISC_FORCE_OUTLIERS_TO_CLOSEST = true
 
+"""
+    LinearDiscretizer{N,D} <: AbstractDiscretizer{N,D}
+
+Encodes values into bins defined by a sorted list of edges.
+
+# Fields
+* `binedges::Vector{N}`: bin edges, sorted smallest to largest.
+* `nbins::Int`: number of bins, i.e. `length(binedges) - 1`.
+* `force_outliers_to_closest::Bool`: if `true`, values outside `binedges`
+  are assigned to the nearest bin instead of raising a `BoundsError`.
+"""
 struct LinearDiscretizer{N<:Real,D<:Integer} <: AbstractDiscretizer{N,D}
     binedges::Vector{N}   # list of bin edges, sorted smallest to largest
     nbins::Int
     force_outliers_to_closest::Bool
 end
 
+"""
+    LinearDiscretizer(binedges, ::Type{D}=Int; force_outliers_to_closest=true)
+
+Construct a [`LinearDiscretizer`](@ref) from a sorted array of bin edges,
+encoding into integer type `D`. Throws an error if fewer than two edges are
+given or if the edges are not sorted in increasing order.
+"""
 function LinearDiscretizer(
     binedges::AbstractArray{N},
     ::Type{D} = Int;
@@ -55,6 +85,15 @@ function LinearDiscretizer(
     )
 end
 
+"""
+    encode(ld::LinearDiscretizer, x) -> Integer
+
+Return the bin id that value `x` falls into, according to `ld`'s bin
+edges. When `x` falls outside the edges, it is either clamped to the
+nearest end bin (if `ld.force_outliers_to_closest`) or a `BoundsError` is
+thrown. When `x` is an `AbstractArray`, `encode` is broadcast element-wise
+and the result reshaped to match `x`'s shape.
+"""
 function encode(ld::LinearDiscretizer{N,D}, x::N) where {N<:Real,D<:Integer}
     !isnan(x) || error("cannot encode NaN values")
 
@@ -88,10 +127,21 @@ end
 
 # --- Uniform-width discretization -----------------------------------------
 
+"""
+    DiscretizeUniformWidth(nbins) <: DiscretizationAlgorithm
+
+Discretize data into `nbins` bins of equal width, spanning the data's
+range (see [`binedges`](@ref)).
+"""
 struct DiscretizeUniformWidth <: DiscretizationAlgorithm
     nbins::Int
 end
 
+"""
+    binedges(alg::DiscretizeUniformWidth, data) -> Vector
+
+Compute `alg.nbins + 1` bin edges spaced evenly across `extrema(data)`.
+"""
 function binedges(alg::DiscretizeUniformWidth, data::AbstractArray{N}) where {N<:AbstractFloat}
     lo, hi = extrema(data)
     @assert(hi > lo)
@@ -105,10 +155,25 @@ end
 
 # --- Uniform-count discretization -----------------------------------------
 
+"""
+    DiscretizeUniformCount(nbins) <: DiscretizationAlgorithm
+
+Discretize data into `nbins` bins each containing (as close to) an equal
+number of data points, by placing edges at the midpoints between sorted
+data values (see [`binedges`](@ref)).
+"""
 struct DiscretizeUniformCount <: DiscretizationAlgorithm
     nbins::Int
 end
 
+"""
+    binedges(alg::DiscretizeUniformCount, data) -> Vector
+
+Compute `alg.nbins + 1` bin edges such that each bin contains an equal (or
+as close to equal as possible) number of sorted data points. Errors if
+`data` has fewer points than `alg.nbins`, or if any resulting edges
+coincide (non-unique bin edges).
+"""
 function binedges(alg::DiscretizeUniformCount, data::AbstractArray{N}) where {N<:AbstractFloat}
 
     nbins = alg.nbins
@@ -170,8 +235,25 @@ end
 # Scargle 2012: http://adsabs.harvard.edu/abs/2012arXiv1207.5578S
 # Python implementation: https://github.com/astroML/astroML/blob/master/astroML/density_estimation/bayesian_blocks.py
 
+"""
+    DiscretizeBayesianBlocks <: DiscretizationAlgorithm
+
+Adaptive discretization that chooses both the number and placement of bins
+by maximizing a Bayesian blocks fitness function over the (sorted) data,
+following Scargle (2012). Unlike [`DiscretizeUniformWidth`](@ref) and
+[`DiscretizeUniformCount`](@ref), the number of bins is not fixed in
+advance; it is determined by [`binedges`](@ref).
+"""
 struct DiscretizeBayesianBlocks <: DiscretizationAlgorithm end
 
+"""
+    binedges(alg::DiscretizeBayesianBlocks, data) -> Vector
+
+Compute Bayesian-blocks bin edges for `data`, following the histogram
+variant of the algorithm in Scargle (2012) (event data, sorted then binned
+by maximizing a fitness function via dynamic programming). The number of
+edges returned, and hence the number of bins, is chosen adaptively.
+"""
 function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {N<:AbstractFloat}
 
     # Single sorted pass to get unique values together with their multiplicities,

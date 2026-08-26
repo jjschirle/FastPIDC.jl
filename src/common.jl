@@ -16,7 +16,28 @@ struct Node
     probabilities::Array{Float64}
 end
 
-# --- PIDC configuration -------------------------------------------
+"""
+    PIDCConfig(; backend=:cuda, discretizer="bayesian_blocks",
+                 estimator="maximum_likelihood", dump_mi_path=nothing,
+                 dump_puc_path=nothing, verbose=false)
+
+Runtime configuration for PUC/PIDC network inference.
+
+# Fields
+* `backend::Symbol`: computation backend, either `:cuda` (default, requires
+  `using CUDA` and a functional GPU) or `:cpu`.
+* `discretizer::String`: discretization method, mirrors the default used by
+  [`get_nodes`](@ref).
+* `estimator::String`: probability estimator, mirrors the default used by
+  [`get_nodes`](@ref).
+* `dump_mi_path::Union{Nothing,String}`: if set, the pairwise MI score matrix
+  is written to `<stem>_mi.npy` (see [`dump_mi_scores`](@ref)).
+* `dump_puc_path::Union{Nothing,String}`: if set, the pre-context PUC score
+  matrix is written to `<stem>_puc.npy` (see [`dump_puc_scores`](@ref)).
+* `verbose::Bool`: print progress information while inferring the network.
+
+Throws an `ArgumentError` if `backend` is not `:cpu` or `:cuda`.
+"""
 Base.@kwdef struct PIDCConfig
     backend::Symbol = :cuda                     # :cuda (default) or :cpu
     discretizer::String = "bayesian_blocks"     # mirrors existing default
@@ -50,11 +71,24 @@ end
 
 # NumPy output helpers
 
+"""
+    _npy_output_path(file_path) -> String
+
+Replace the extension of `file_path` with `.npy`, preserving the stem.
+"""
 function _npy_output_path(file_path::AbstractString)
     stem, _ = splitext(String(file_path))
     return stem * ".npy"
 end
 
+"""
+    _score_output_path(file_path, score_name) -> String
+
+Build the `.npy` output path for a score dump named `score_name`
+(`:mi` or `:puc`), appending a `_mi`/`_puc` suffix to the stem of
+`file_path` unless it is already present. Throws an `ArgumentError` for any
+other `score_name`.
+"""
 function _score_output_path(file_path::AbstractString, score_name::Symbol)
     score_name in (:mi, :puc) ||
         throw(ArgumentError("score_name must be :mi or :puc, got :$score_name"))
@@ -65,11 +99,23 @@ function _score_output_path(file_path::AbstractString, score_name::Symbol)
     return endswith(stem, suffix) ? npy_path : stem * suffix * ".npy"
 end
 
+"""
+    _network_genes_path(file_path) -> String
+
+Path of the gene-label sidecar file (`<stem>_genes.txt`) that accompanies
+an inferred-network `.npy` dump at `file_path`.
+"""
 function _network_genes_path(file_path::AbstractString)
     stem, _ = splitext(_npy_output_path(file_path))
     return stem * "_genes.txt"
 end
 
+"""
+    _score_genes_path(file_path, score_name) -> String
+
+Path of the gene-label sidecar file (`<stem>_genes.txt`) that accompanies
+the `score_name` (`:mi` or `:puc`) `.npy` dump derived from `file_path`.
+"""
 function _score_genes_path(file_path::AbstractString, score_name::Symbol)
     score_path = _score_output_path(file_path, score_name)
     stem, _ = splitext(score_path)
@@ -77,6 +123,12 @@ function _score_genes_path(file_path::AbstractString, score_name::Symbol)
     return chop(stem; tail = length(suffix)) * "_genes.txt"
 end
 
+"""
+    _write_genes_file(file_path, nodes)
+
+Write one [`Node`](@ref) label per line to `file_path`, in the order given
+by `nodes`, to serve as the row/column key for a companion `.npy` matrix.
+"""
 function _write_genes_file(file_path::AbstractString, nodes)
     open(file_path, "w") do io
         for node in nodes
@@ -87,8 +139,16 @@ function _write_genes_file(file_path::AbstractString, nodes)
 end
 
 
-# Constructs a Node from a line of a data file. line should be an array with
-# the label as the first element, then the raw data values.
+"""
+    Node(line::AbstractArray, discretizer, estimator, number_of_bins) -> Node
+
+Construct a [`Node`](@ref) from one row of a data file: `line` is an array
+whose first element is the node's label and whose remaining elements are
+its raw (continuous) data values. The raw values are discretized using
+`discretizer` (overwriting `number_of_bins` if it is `"bayesian_blocks"`,
+which chooses its own bin count) and the per-bin probabilities are then
+estimated using `estimator`.
+"""
 function Node(line::AbstractArray, discretizer, estimator, number_of_bins)
 
     label = string(line[1])
@@ -112,7 +172,14 @@ function Node(line::AbstractArray, discretizer, estimator, number_of_bins)
 end
 
 
-# Mutual information and specific information for a node pair
+"""
+    get_mi_and_si(node1::Node, node2::Node, estimator, base) -> (mi, si1, si2)
+
+Compute the mutual information `mi` between `node1` and `node2`, along with
+the specific information of each node with respect to the other (`si1` for
+`node1`, `si2` for `node2`), using probabilities estimated with `estimator`
+and logarithms of base `base`.
+"""
 function get_mi_and_si(node1::Node, node2::Node, estimator, base)
     probabilities, probabilities1, probabilities2 =
         get_joint_probabilities(node1, node2, estimator)
@@ -139,9 +206,13 @@ function get_mi_and_si(node1::Node, node2::Node, estimator, base)
     return mi, si1, si2
 end
 
-# Type for caching information between pairs of nodes:
-# - mi: mutual information
-# - si: specific information
+"""
+Cache of information measures for an ordered pair of nodes.
+
+Fields:
+* `mi`: mutual information between the two nodes
+* `si`: specific information of the first node with respect to the second
+"""
 struct NodePair
     mi::Float64
     si::Array{Float64}

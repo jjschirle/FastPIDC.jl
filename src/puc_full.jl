@@ -4,9 +4,45 @@
 # Reduces complexity from O(N^3 B) to O(N^2 B log N).
 using SharedArrays
 
-# Placeholder for CUDA extension
+"""
+    compute_puc_full_cuda(nodes, config, base)
+
+GPU implementation of [`compute_puc_full`](@ref), defined by the
+`FastPIDCCUDAExt` package extension (loaded automatically when `using
+CUDA` and a functional GPU is available). Calling this without the
+extension loaded raises a `MethodError`; [`compute_puc_full`](@ref) checks
+for the method's existence before dispatching to it.
+"""
 function compute_puc_full_cuda end
 
+"""
+    compute_puc_full(nodes::Vector{Node}; estimator="maximum_likelihood",
+                      base=2, config=PIDCConfig()) -> (mi_scores, puc_scores)
+
+Compute the full pairwise MI matrix and pre-context Proportional Unique
+Contribution (PUC) matrix for `nodes`.
+
+For every ordered triple `(x, y, z)` of distinct nodes, the redundancy
+between sources `x` and `y` with respect to target `z` is computed from
+cached specific-information values, and `PUC(x, z) += (MI(x,z) -
+redundancy) / MI(x,z)` (clamped to be non-negative, and skipped when
+`MI(x,z)` is ~0) is accumulated symmetrically. This is the "sorting trick"
+formulation, reducing complexity from `O(N^3 B)` to `O(N^2 B log N)`
+relative to a naive implementation (`N` = number of nodes, `B` = number of
+bins).
+
+# Arguments
+* `nodes`: nodes to score.
+* `estimator="maximum_likelihood"`: probability estimator.
+* `base=2`: logarithm base for the information measures.
+* `config=PIDCConfig()`: selects the computation backend
+  (`config.backend`, `:cpu` or `:cuda`) and verbosity. When `:cuda` is
+  requested, dispatches to [`compute_puc_full_cuda`](@ref) (from the CUDA
+  package extension) and errors if that extension is not loaded.
+
+Returns a tuple `(mi_scores, puc_scores)`, each a dense
+`length(nodes)`-by-`length(nodes)` matrix.
+"""
 function compute_puc_full(
     nodes::Vector{Node};
     estimator::String = "maximum_likelihood",

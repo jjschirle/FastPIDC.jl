@@ -1,0 +1,7 @@
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+FastPIDC = "2e136e29-5425-4b9c-aa6d-e9e617c08fea"
+
+[compat]
+Documenter = "1"

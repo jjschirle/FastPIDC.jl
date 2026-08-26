@@ -1,3 +1,12 @@
+"""
+    FastPIDCCUDAExt
+
+Package extension providing a CUDA-accelerated implementation of
+[`FastPIDC.compute_puc_full_cuda`](@ref), loaded automatically once
+`using CUDA` makes the `CUDA` package available alongside `FastPIDC`.
+Selected by passing `config.backend = :cuda` (the default) to
+[`FastPIDC.compute_puc_full`](@ref).
+"""
 module FastPIDCCUDAExt
 
 using FastPIDC
@@ -7,6 +16,13 @@ using CUDA
 
 """
     joint_counts_kernel_chunked!(data, counts, n, m, k_bins, z_start, z_chunk_size)
+
+CUDA kernel: for a chunk of `z_chunk_size` target genes starting at
+`z_start`, accumulate the joint bin-count histogram `counts[u, v, x,
+z_local]` (co-occurrences of bin `u` for gene `x` and bin `v` for gene
+`z_global = z_start + z_local - 1`) across all `m` samples in `data`. One
+GPU thread handles one `(x, z_local)` pair; `n` is the number of genes and
+`k_bins` the number of discretization bins.
 """
 function joint_counts_kernel_chunked!(data, counts, n, m, k_bins, z_start, z_chunk_size)
     x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -32,6 +48,16 @@ end
 
 """
     mi_si_kernel_chunked!(counts, marginals, mi_matrix, si_matrix, n, m, k_bins, z_start, z_chunk_size)
+
+CUDA kernel: from the joint bin counts `counts` (as produced by
+[`joint_counts_kernel_chunked!`](@ref)) and per-gene marginal bin
+probabilities `marginals`, compute the mutual information
+`mi_matrix[x, z_global]` and the specific information
+`si_matrix[:, x, z_local]` of gene `x` with respect to target gene
+`z_global = z_start + z_local - 1`, for the chunk of `z_chunk_size` targets
+starting at `z_start`. One GPU thread handles one `(x, z_local)` pair; `n`
+is the number of genes, `m` the number of samples, and `k_bins` the number
+of discretization bins.
 """
 function mi_si_kernel_chunked!(counts, marginals, mi_matrix, si_matrix, n, m, k_bins, z_start, z_chunk_size)
     x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -72,6 +98,17 @@ end
 
 """
     puc_accumulation_kernel_chunked!(si_matrix, mi_matrix, puc_scores, marginals, n, k_bins, z_start, z_chunk_size)
+
+CUDA kernel: for each target gene `z_global` in the current chunk and each
+source gene `x`, accumulate the PUC contribution
+`puc_scores[x, z_global] += (MI(x, z_global) - redundancy(x, y, z_global)) /
+MI(x, z_global)` (clamped to be non-negative) summed over all other genes
+`y`, using specific information values from `si_matrix` and marginal
+probabilities from `marginals`. One GPU thread handles one `(x, z_local)`
+pair, looping internally over `y`; `n` is the number of genes and `k_bins`
+the number of discretization bins. Contributions still need to be
+symmetrized (`puc_scores[i,j] + puc_scores[j,i]`) by the caller, since each
+thread only writes `puc_scores[x, z_global]`.
 """
 function puc_accumulation_kernel_chunked!(si_matrix, mi_matrix, puc_scores, marginals, n, k_bins, z_start, z_chunk_size)
     x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -114,6 +151,20 @@ end
 
 # --- Host Implementation ---
 
+"""
+    FastPIDC.compute_puc_full_cuda(nodes, config, base) -> (mi_scores, puc_scores)
+
+GPU implementation of [`FastPIDC.compute_puc_full`](@ref): computes the full
+pairwise MI matrix and pre-context PUC matrix for `nodes` on the GPU,
+processing genes along the target (`z`) axis in chunks of 256 to bound
+device memory use. Moves discretized data and marginal probabilities to
+the GPU once, then for each chunk launches
+[`joint_counts_kernel_chunked!`](@ref), [`mi_si_kernel_chunked!`](@ref) and
+[`puc_accumulation_kernel_chunked!`](@ref) in sequence, symmetrizing the
+resulting PUC matrix before returning both matrices to the CPU.
+`config.verbose` enables progress printouts; `base` is currently unused
+(mutual information is always computed in base 2 on the GPU path).
+"""
 function FastPIDC.compute_puc_full_cuda(nodes, config, base)
     num_nodes = length(nodes)
     num_samples = length(nodes[1].binned_values)

@@ -2,6 +2,7 @@
 
 [![Build Status](https://travis-ci.org/Tchanders/NetworkInference.jl.svg?branch=master)](https://travis-ci.org/Tchanders/NetworkInference.jl)
 [![codecov.io](http://codecov.io/github/Tchanders/NetworkInference.jl/coverage.svg?branch=master)](http://codecov.io/github/Tchanders/NetworkInference.jl?branch=master)
+[![Docs](https://img.shields.io/badge/docs-stable-blue.svg)](https://meyer-lab.github.io/FastPIDC.jl/)
 
 ## Description
 

@@ -1,3 +1,13 @@
+"""
+    FastPIDC
+
+A package for inferring undirected gene regulatory (or other) networks from
+per-node measurements, using information-theoretic algorithms: MI, CLR, PUC
+and PIDC (Chan, Stumpf & Babtie 2017). The main entry points are
+[`get_nodes`](@ref)/[`infer_network`](@ref) to build an [`InferredNetwork`](@ref)
+from a data file, and [`write_network_file`](@ref)/[`write_network_npy`](@ref)
+to save the result.
+"""
 module FastPIDC
 
 using Distributions

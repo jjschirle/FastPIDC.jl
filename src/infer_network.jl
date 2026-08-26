@@ -1,6 +1,13 @@
 # Helper functions for inferring a network from a data file
 
-# Entry point: checks extension and routes to the right loader
+"""
+    get_nodes(data_file_path::String; <keyword arguments>) -> Vector{Node}
+
+Gets an array of all [`Node`](@ref)s from a data file. Dispatches to
+[`get_nodes_h5`](@ref) for `.h5` files, or to the whitespace/delimited text
+loader otherwise (see the text-file method below for its format and
+keyword arguments).
+"""
 function get_nodes(
     data_file_path::String;
     delim::Union{Char,Bool} = false,
@@ -15,7 +22,30 @@ function get_nodes(
     end
 end
 
-# --- HDF5 Loader ---
+"""
+    get_nodes_h5(data_file_path::String; <keyword arguments>) -> Vector{Node}
+
+Gets an array of all [`Node`](@ref)s from an HDF5 (`.h5`) expression file.
+
+The file must contain a `"gene_names"` dataset, and an expression matrix
+under one of `"matrix_sparse_csc"`, `"matrix_dense"`, `"X"`, `"matrix"` or
+`"data"` (checked in that order). The matrix may be a dense HDF5 dataset
+(assumed to be `(genes, cells)` in C order, as written by
+[AnnData](https://anndata.readthedocs.io/)/scanpy, and transposed on load)
+or an HDF5 group holding a CSC sparse matrix (`"data"`, `"indices"`,
+`"indptr"` datasets plus a `"shape"` attribute, using Python's 0-based
+indexing, which is converted to Julia's 1-based indexing on load). In both
+cases the on-disk layout is `(cells, genes)` after loading.
+
+# Arguments
+* `data_file_path`: path to the `.h5` file.
+* `discretizer="bayesian_blocks"`: algorithm for discretizing the data.
+* `estimator="maximum_likelihood"`: algorithm for estimating probabilities.
+* `number_of_bins=10`: will be overwritten if using `"bayesian_blocks"`.
+
+Throws an `ArgumentError` if the expected datasets, matrix key or matrix
+group members/attributes are missing.
+"""
 function get_nodes_h5(
     data_file_path::String;
     discretizer = "bayesian_blocks",
