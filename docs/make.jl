@@ -25,5 +25,3 @@ makedocs(;
         "API Reference" => "api.md",
     ],
 )
-
-deploydocs(; repo = "github.com/meyer-lab/FastPIDC.jl", devbranch = "master")
