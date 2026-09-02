@@ -156,23 +156,24 @@ end
 
 GPU implementation of [`FastPIDC.compute_puc_full`](@ref): computes the full
 pairwise MI matrix and pre-context PUC matrix for `nodes` on the GPU,
-processing genes along the target (`z`) axis in chunks of 256 to bound
-device memory use. Moves discretized data and marginal probabilities to
-the GPU once, then for each chunk launches
+processing genes along the target (`z`) axis in chunks (up to 256 genes at
+a time) sized to fit the GPU memory currently free, to bound device memory
+use even when the discretizer has picked a large number of bins (see the
+chunk-sizing comment in the implementation). Moves discretized data and
+marginal probabilities to the GPU once, then for each chunk launches
 [`joint_counts_kernel_chunked!`](@ref), [`mi_si_kernel_chunked!`](@ref) and
 [`puc_accumulation_kernel_chunked!`](@ref) in sequence, symmetrizing the
 resulting PUC matrix before returning both matrices to the CPU.
 `config.verbose` enables progress printouts; `base` is currently unused
-(mutual information is always computed in base 2 on the GPU path).
+(mutual information is always computed in base 2 on the GPU path). Raises
+an `ErrorException` with a suggested remedy if even a single-gene chunk
+would not fit in the currently-free GPU memory.
 """
 function FastPIDC.compute_puc_full_cuda(nodes, config, base)
     num_nodes = length(nodes)
     num_samples = length(nodes[1].binned_values)
     k_bins = maximum(n -> n.number_of_bins, nodes)
-    
-    # Chunk configuration (512 genes at a time)
-    chunk_size = 256 
-    
+
     # Prepare static data on CPU and move to GPU
     data_cpu = zeros(Int32, num_samples, num_nodes)
     marginals_cpu = zeros(Float64, k_bins, num_nodes)
@@ -188,14 +189,45 @@ function FastPIDC.compute_puc_full_cuda(nodes, config, base)
     # Global output matrices
     puc_scores_gpu = CUDA.zeros(Float64, num_nodes, num_nodes)
     mi_matrix_gpu = CUDA.zeros(Float64, num_nodes, num_nodes)
-    
+
+    # Chunk configuration: `counts_chunk_gpu`/`si_chunk_gpu` scale as
+    # k_bins^2 * num_nodes * chunk_size / k_bins * num_nodes * chunk_size
+    # respectively, so an adaptive discretizer that picks a large k_bins
+    # (e.g. "bayesian_blocks", the package default, on a dataset with many
+    # samples -- it has no upper bound on the number of bins it selects)
+    # can make even a modest fixed chunk_size request far larger than the
+    # GPU's total memory. Size the chunk to fit within what's actually free
+    # right now instead of always requesting a fixed chunk_size=256, and
+    # fail with an actionable message rather than a raw CUDA OOM error if
+    # even a single-gene chunk doesn't fit.
+    bytes_per_chunk_col =
+        k_bins^2 * num_nodes * sizeof(Int32) +  # counts_chunk_gpu
+        k_bins * num_nodes * sizeof(Float64)     # si_chunk_gpu
+    free_bytes, _ = CUDA.memory_info()
+    safety_factor = 0.8  # headroom for the fixed buffers above + allocator overhead/fragmentation
+    max_chunk_size = floor(Int, free_bytes * safety_factor / bytes_per_chunk_col)
+    chunk_size = clamp(max_chunk_size, 1, min(256, num_nodes))
+
+    if max_chunk_size < 1
+        error(
+            "compute_puc_full_cuda: even a single-gene chunk would require " *
+            "$(round(bytes_per_chunk_col / 2^30, digits = 2)) GiB of GPU memory " *
+            "(only $(round(free_bytes * safety_factor / 2^30, digits = 2)) GiB " *
+            "usable), because the discretizer selected k_bins=$k_bins bins per " *
+            "gene. This is usually caused by an adaptive discretizer (e.g. " *
+            "\"bayesian_blocks\", the default) picking an unbounded number of " *
+            "bins on a dataset with many samples. Try discretizer=\"uniform_width\" " *
+            "with a fixed, small number_of_bins (e.g. 10-20), or config.backend = :cpu.",
+        )
+    end
+
     # Chunked intermediate buffers (Pre-allocated once!)
     counts_chunk_gpu = CUDA.zeros(Int32, k_bins, k_bins, num_nodes, chunk_size)
     si_chunk_gpu = CUDA.zeros(Float64, k_bins, num_nodes, chunk_size)
     
     if config.verbose
-        println("[FastPIDC] GPU Chunked PUC: Processing $num_nodes x $num_nodes pairs...")
-        println("[FastPIDC] Using chunk size of $chunk_size (approx. $(ceil(Int, num_nodes/chunk_size)) iterations)")
+        println("[FastPIDC] GPU Chunked PUC: Processing $num_nodes x $num_nodes pairs (k_bins=$k_bins)...")
+        println("[FastPIDC] Using chunk size of $chunk_size (approx. $(ceil(Int, num_nodes/chunk_size)) iterations), sized to fit $(round(free_bytes / 2^30, digits = 2)) GiB free GPU memory")
     end
     
     # Iterate over the Z-axis in chunks
