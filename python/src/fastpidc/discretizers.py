@@ -262,6 +262,44 @@ def _encode_uniform_width(values: np.ndarray, number_of_bins: int) -> tuple[np.n
     return LinearDiscretizer(edges).encode(values), number_of_bins
 
 
+def get_bin_ids_zero_as_own_bin(values: np.ndarray, number_of_bins: int) -> tuple[np.ndarray, int]:
+    """Discretize ``values`` giving exact zeros their own dedicated bin (bin
+    0), then equal-frequency ("uniform_count") binning the nonzero values
+    into the remaining ``number_of_bins - 1`` bins.
+
+    Motivated by dropout-dominated single-cell count/expression data, where
+    "detected vs. not detected" is itself informative and a naive
+    equal-frequency discretizer run on all values (zero and nonzero mixed)
+    would otherwise split the zero mass arbitrarily across multiple bins
+    whenever zeros exceed one bin's worth of the data, or absorb nonzero
+    values into a zero-dominated bin -- either way conflating "not detected"
+    with "detected but low" in a way that depends on the zero fraction
+    rather than reflecting a real difference in expression level.
+
+    Falls back to a plain two-bin zero/nonzero split if ``number_of_bins`` is
+    too small to also split the nonzero values, or if there are no nonzero
+    values at all (equivalent then to the ``get_bin_ids`` ``lo == hi`` case).
+    """
+    values = np.asarray(values, dtype=np.float64)
+    zero_mask = values == 0
+    nonzero = values[~zero_mask]
+
+    if nonzero.size == 0:
+        return np.zeros(values.shape, dtype=np.int64), 1
+
+    if number_of_bins <= 1 or nonzero.size < number_of_bins - 1:
+        # Not enough room/data for equal-frequency splitting of the nonzero
+        # values; fall back to a single "nonzero" bin alongside the zero bin.
+        bin_ids = zero_mask.astype(np.int64) ^ 1  # 0 if zero, 1 if nonzero
+        return bin_ids, 2
+
+    nonzero_ids, nonzero_nbins = get_bin_ids(nonzero, "uniform_count", number_of_bins - 1)
+
+    bin_ids = np.zeros(values.shape, dtype=np.int64)
+    bin_ids[~zero_mask] = nonzero_ids + 1
+    return bin_ids, nonzero_nbins + 1
+
+
 def get_bin_ids(values: np.ndarray, mode: str, number_of_bins: int) -> tuple[np.ndarray, int]:
     """Discretize ``values`` into bin ids using discretization method ``mode``.
 
@@ -299,6 +337,9 @@ def get_bin_ids(values: np.ndarray, mode: str, number_of_bins: int) -> tuple[np.
             warnings.warn("Uniform count failed, fell back to uniform width", RuntimeWarning, stacklevel=2)
             return _encode_uniform_width(values, number_of_bins)
         return LinearDiscretizer(edges).encode(values), number_of_bins
+
+    if mode == "zero_as_own_bin":
+        return get_bin_ids_zero_as_own_bin(values, number_of_bins)
 
     if mode == "bayesian_blocks":
         try:

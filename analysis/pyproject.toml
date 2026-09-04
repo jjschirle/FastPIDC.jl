@@ -1,0 +1,21 @@
+[project]
+name = "fastpidc-analysis"
+version = "0.0.0"
+description = "Scratch environment for evaluating the interventional-PID and degree-recalibration plans against Arc/Replogle Perturb-seq data. Not a published package."
+requires-python = ">=3.12"
+dependencies = [
+    "fastpidc",
+    "vsparse>=0.2.0",
+    "anndata>=0.13",
+    "pandas>=2.0",
+    "statsmodels>=0.14",
+    "matplotlib>=3.9",
+    "cupy-cuda12x>=12.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+fastpidc = { path = "../python", editable = true }
+vsparse = { path = "/home/asm/vsparse", editable = true }

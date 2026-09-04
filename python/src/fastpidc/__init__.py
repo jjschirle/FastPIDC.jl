@@ -21,6 +21,7 @@ from .network import (
     PIDCNetworkInference,
     PUCNetworkInference,
 )
+from .pid import PIDTriple, combined_node, pid_triple
 from .types import Edge, InferredNetwork, Node, PIDCConfig
 
 __all__ = [
@@ -42,6 +43,10 @@ __all__ = [
     "read_network_file",
     "get_adjacency_matrix",
     "infer_network",
+    # Triple partial information decomposition
+    "PIDTriple",
+    "combined_node",
+    "pid_triple",
 ]
 
 __version__ = "0.1.0"
