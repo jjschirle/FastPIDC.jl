@@ -320,9 +320,56 @@ BH-FDR) against the residualized array via `rerun_stage4_residualized.py` (paral
 suffixed `_resid`, rather than overwriting the originals — `E_matrix_resid.npy`,
 `k_out_resid.csv`, etc.) to see whether even that modest variance removal meaningfully shrinks the
 implausible tail of $\hat k^{\mathrm{out}}_g$, given how much statistical power this dataset has
-(a small mean shift can still clear q<0.05 at these sample sizes). **Result and verdict:
-pending — see next LOG.md entry once the rerun finishes and is compared against the original
-`k_out.csv`.**
+(a small mean shift can still clear q<0.05 at these sample sizes). **Result: negative. Cell-cycle regression alone does not fix the D0 confound — if anything, the
+residualized numbers are slightly worse.**
+
+| | original (`k_out.csv`) | cell-cycle-residualized (`k_out_resid.csv`) |
+|---|---|---|
+| range | 1,003 – 11,559 | 1,036 – 11,680 |
+| mean | 4,481 | 4,656 |
+| median | 4,133 | 4,196.5 |
+| targets with $\hat k^{\mathrm{out}} \geq 10$ | 150/150 | 150/150 |
+
+Per-target comparison: median change **+72.5**, mean change **+175.8** ($\hat k^{\mathrm{out}}$
+went *up* after residualization for 135/150 targets, down for only 15/150). `PRDM14` is now the
+single largest offender at 11,680/11,942 (97.8% of the filtered genome), essentially unchanged from
+the pre-residualization tail. Correlation with `n_pert` is still weakly negative (r = −0.117,
+matching the original −0.12) — still not simply a power artifact in the crude sense, but that was
+never in question.
+
+**Interventional Checkpoint 3 (SOX2 → POU5F1/NANOG) also got no better, and SOX2's own confound
+caveat got slightly worse**: both edges remain q≈0 after residualization (POU5F1 energy-distance²
+0.071 → 0.053, NANOG 0.135 → 0.128 — both still highly significant, magnitudes shrank slightly as
+expected since *some* shared variance was removed), so the positive-control recovery itself is
+robust to this conditioning. But SOX2's own $\hat k^{\mathrm{out}}$ **increased** from 8,941/11,942
+(~75%) to 9,536/11,942 (~80%) — the exact opposite of what conditioning on the confound should do
+if cell-cycle were the dominant driver.
+
+Sanity checks before trusting this null result: (1) the residualized null's mean/SD-vs-size scaling
+matches the original run's within ~0.5% at every representative size (e.g. mean null e² at size 50:
+0.009565 residualized vs. 0.009570 original) — the null-calibration machinery itself did not break
+on the residualized input, so the flat/negative result isn't a null-calibration artifact; (2) only
+~1.5% of per-gene variance was removed by the two cell-cycle scores in the first place (see the
+entry above) — in retrospect this result is exactly what that small an adjustment predicts, given
+how much statistical power this dataset has (thousands of cells per group, >50k UMI/cell): a 1.5%
+variance reduction is nowhere near enough to move q-values computed at that power.
+
+**Conclusion, stated plainly: cell-cycle scoring/regression, on its own, is not the fix for the D0
+out-degree inflation.** The interventional plan's own "Secondary concern" language named both "cell
+cycle" *and* "differentiation-propensity heterogeneity" as risks — this result is consistent with
+the latter (or some other shared axis not captured by the Tirosh/Seurat S/G2M marker genes) being
+the actual dominant confound, not cell-cycle phase per se. **This is now a re-opened, harder
+problem, not a closed one**: before the companion plan's V3/V4 can trust $\hat k^{\mathrm{out}}_g$
+as a real degree prior, a different or additional conditioning strategy is needed — candidates worth
+trying next: (a) a data-driven state axis (e.g. top PCs of the NTC-only cells, or a diffusion
+pseudotime/differentiation score) rather than a curated marker-gene score, regressed out the same
+way; (b) stratifying the NTC-null calibration by state bin instead of (or in addition to)
+regression, so the null itself absorbs the heterogeneity rather than assuming a linear correction
+removes it; (c) checking whether the top-$\hat k^{\mathrm{out}}$ targets (`PRDM14`, `METTL14`,
+`METTL3`, `KDM1A`, `SMARCA4`, ...) share a annotatable biological theme (several of these are
+chromatin/epigenetic regulators, which is *itself* a plausible reason for broad transcriptional
+disruption rather than proof of confounding — worth a literature gut-check before assuming this is
+purely technical). Not resolved in this session; flagged as the concrete next blocker in `STATE.md`.
 
 ## 2026-09-04 — CUDA backend validation (Prerequisites item 3)
 

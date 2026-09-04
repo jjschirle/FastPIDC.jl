@@ -27,7 +27,7 @@ Legend: ✅ done · 🟡 in progress / partial · ⬜ not started · 🚫 blocke
 | **0** | ≥~2,000 reciprocal testable pairs | ✅ **PASS** | 150 targets (not the assumed ~300 — see `LOG.md`), all clear cell-count + phenotype screens. `C(150,2) = 11,175` pairs. No Replogle fallback needed for feasibility. |
 | 1 | MI invariant under equal-frequency binning | ⬜ | Not started (discretizer now ready — see Stage 2 below — but the actual invariance run hasn't happened yet). |
 | 2 | Bootstrap edge recovery >50% at top-k | ⬜ | Not started. Needs Stage 3 (observational skeleton on NTC cells) first, which needs a working discretization pipeline. CUDA backend now installed and validated (`cupy-cuda12x`, see Prerequisites item 3) so the compute path is no longer the blocker — Stage 3 itself just hasn't been run yet. |
-| 3 | Self-effects present; known pluripotency edges recovered | ✅ | Self-effect: **150/150 pass** (q<0.05, down; Checkpoint-0 byproduct). Pluripotency edges: **recovered** — `SOX2` (measured + targeted) shows q≈0 shifts in both `POU5F1` and `NANOG`, using the real Stage-4 effect matrix (not the Checkpoint-0 proxy). Caveat in `LOG.md`: `SOX2`'s own $\hat k^{\mathrm{out}}$ is ~75% of the filtered genome, so this is necessary-but-not-sufficient given the cell-state-confound issue flagged under D0 below. |
+| 3 | Self-effects present; known pluripotency edges recovered | ✅ | Self-effect: **150/150 pass** (q<0.05, down; Checkpoint-0 byproduct). Pluripotency edges: **recovered, and robust to cell-cycle residualization** — `SOX2` (measured + targeted) shows q≈0 shifts in both `POU5F1` (energy-distance² 0.071→0.053) and `NANOG` (0.135→0.128) before and after cell-cycle regression. Caveat unchanged/worsened: `SOX2`'s own $\hat k^{\mathrm{out}}$ is ~75–80% of the filtered genome (went *up* slightly after cell-cycle residualization, 8,941→9,536), so this is still necessary-but-not-sufficient — see D0 below, now a re-opened problem, not resolved by the cell-cycle fix that was tried. |
 | 4 | Sibling calls stable across redundancy measures (I_min vs BROJA/I_ccs) | ⬜ | Not started; blocked on Stage 6 existing at all, and on sourcing a non-I_min PID implementation (`fastpidc` only has I_min — see `LOG.md`). |
 | 5 | PID beats mediation regression (H3, the kill criterion) | ⬜ | Not started; last in the pipeline by design. |
 
@@ -49,7 +49,7 @@ Legend: ✅ done · 🟡 in progress / partial · ⬜ not started · 🚫 blocke
 
 | # | Gate | Status | Result |
 |---|---|---|---|
-| **D0** | Enough targets with non-degenerate measured $\hat k^{\mathrm{out}}$ | 🟡 **PASS, with a caveat that blocks trusting the number yet** | $\hat k^{\mathrm{out}}_g$ ranges 1,003–11,559 / 11,942 genes (>11× spread, none near zero) — technically clears the gate. But the top of that range (~97% of the genome "significant" for one target) is not a credible functional out-degree; almost certainly reflects hESC cell-state/cycle composition shifting under perturbation rather than 150 independent direct regulatory programs, exactly the risk the plan's own Checkpoint 0 "Secondary concern" flagged. **Needs cell-cycle/state regression or stratification before $\hat k^{\mathrm{out}}_g$ is fit as a real degree prior** — that's the concrete next blocker, not a re-run of what's already done. Full table: `k_out.csv` (scratchpad, not committed). |
+| **D0** | Enough targets with non-degenerate measured $\hat k^{\mathrm{out}}$ | 🚫 **PASS on the letter of the gate, but the confound is NOT resolved — cell-cycle regression tried and failed** | $\hat k^{\mathrm{out}}_g$ ranges 1,003–11,559 / 11,942 genes originally (>11× spread, none near zero) — technically clears the gate. Tried the obvious fix (regress S/G2M cell-cycle scores out of expression, re-run Stage 4 on residuals — `LOG.md` 2026-09-04 "Cell-cycle / cell-state conditioning"): **it didn't work.** Residualized $\hat k^{\mathrm{out}}_g$ range 1,036–11,680, mean 4,656 (was 4,481), median 4,196.5 (was 4,133) — *higher* for 135/150 targets (median +72.5). SOX2's own out-degree got worse (8,941→9,536/11,942, ~75%→~80%). Only ~1.5% of per-gene variance was explained by cell-cycle scores in the first place, which in hindsight predicts exactly this null result given the dataset's statistical power. **Conclusion: the dominant confound is not cell-cycle phase** (or not fully — the plan's own "differentiation-propensity heterogeneity" language covers exactly this possibility). **This is a re-opened blocker, not a closed one** — see next actions below for candidate follow-ups (data-driven state axis instead of curated marker genes; stratified null instead of linear regression; check whether top-$\hat k^{\mathrm{out}}$ targets like `PRDM14`/`METTL14`/`METTL3`/`KDM1A`/`SMARCA4` share a chromatin/epigenetic-regulator theme that might be a real broad effect, not pure confound). Tables: `k_out.csv` / `k_out_resid.csv` (scratchpad, not committed). |
 | D1 | V2 (hierarchical gamma) does not reduce bootstrap stability | ⬜ | Not started; depends on interventional-plan Stage 3 existing. |
 | D2 | V1 (direction-aware calibration) beats V2 on held-out effect recovery | ⬜ | Not started. |
 | D3 | Known hubs (POU5F1, NANOG, SOX2) survive increasing λ in V3 | ⬜ | Not started; note all three are measured, `SOX2` is also itself a perturbation target. |
@@ -62,17 +62,21 @@ side (raw PUC access confirmed) whenever Stage 3's skeleton exists to calibrate.
 
 ## Immediate next actions (carried over from both plans, reordered by what's actually next)
 
-1. **Cell-cycle / cell-state conditioning before trusting $\hat k^{\mathrm{out}}_g$.** 🟡 In
-   progress: `analysis/scripts/cell_cycle.py` scores every cell for S/G2M activity (Tirosh/Seurat
-   marker lists, scanpy-style module scoring) and regresses both scores out of the gene-major
-   filtered expression matrix (vectorized OLS across all 11,942 genes at once — see the script's
-   docstring for the matmul identity that avoids transposing the 11 GB array). Only ~1.5% of
-   per-gene variance is explained by the two cell-cycle scores alone, smaller than hoped — the
-   plan's "differentiation-propensity heterogeneity" axis is likely a separate, larger confound
-   not captured by cell-cycle scoring alone. `rerun_stage4_residualized.py` reruns Stage 4
-   end-to-end (effect matrix → null calibration → BH-FDR) against the residualized array,
-   producing `k_out_resid.csv` to compare against the original `k_out.csv`. **Running as of this
-   entry — result and verdict not yet in LOG.md.**
+1. **Cell-cycle / cell-state conditioning before trusting $\hat k^{\mathrm{out}}_g$.** 🚫 **Tried,
+   failed, re-opened.** `analysis/scripts/cell_cycle.py` scores every cell for S/G2M activity
+   (Tirosh/Seurat marker lists, scanpy-style module scoring) and regresses both scores out of the
+   gene-major filtered expression matrix; `rerun_stage4_residualized.py` reran Stage 4 end-to-end
+   against the residuals. **Result: no improvement** — residualized $\hat k^{\mathrm{out}}_g$ went
+   *up* for 135/150 targets (median +72.5), and SOX2's own out-degree got worse (~75%→~80%). Only
+   ~1.5% of per-gene variance was explained by the two cell-cycle scores, which predicts this null
+   result in hindsight. See `LOG.md` 2026-09-04 "Cell-cycle / cell-state conditioning" for full
+   numbers and sanity checks (null-scaling verified unaffected, so this isn't a calibration bug).
+   **Next candidate fixes, not yet tried:** (a) a data-driven state axis (top PCs of NTC cells, or
+   a pseudotime/differentiation score) instead of curated cell-cycle marker genes; (b) stratifying
+   the null calibration by state bin instead of linear regression; (c) a literature/annotation
+   check on whether the current top-$\hat k^{\mathrm{out}}$ targets (`PRDM14`, `METTL14`,
+   `METTL3`, `KDM1A`, `SMARCA4`, ...) are chromatin/epigenetic regulators whose broad effect might
+   be partly real, not purely a confound artifact.
 2. ✅ Implemented the zero-as-own-bin discretizer (`fastpidc.discretizers.get_bin_ids_zero_as_own_bin`,
    wired into `get_bin_ids(..., mode="zero_as_own_bin")`, so it's usable directly via
    `Node.from_raw_values(..., discretizer="zero_as_own_bin", ...)` — no bypass of the public API

@@ -37,7 +37,7 @@ CHUNK_SIZE = 1500
 
 
 def _null_worker(args):
-    size, rep_seed, chunk_start, chunk_end, chunk_id = args
+    size, rep_seed, chunk_start, chunk_end, chunk_id, genemajor_path = args
     targets_obs = pickle.load(open(SCRATCH / "obs_target_gene.pkl", "rb"))
     ntc_indices = np.where(targets_obs == "non-targeting")[0]
 
@@ -46,7 +46,7 @@ def _null_worker(args):
     pseudo_target = perm[:size]
     pseudo_control = perm[size:]  # rest of the NTC pool
 
-    Xg = np.load(X_GENEMAJOR_PATH, mmap_mode="r")
+    Xg = np.load(genemajor_path, mmap_mode="r")
     block = np.asarray(Xg[chunk_start:chunk_end, :])
     a = block[:, pseudo_target].T
     b = block[:, pseudo_control].T
@@ -54,7 +54,16 @@ def _null_worker(args):
     return size, rep_seed, chunk_id, e2
 
 
-def compute_null(max_workers: int = 16) -> None:
+def compute_null(
+    max_workers: int = 16,
+    genemajor_path: Path = X_GENEMAJOR_PATH,
+    mean_name: str = "null_mean_by_size.npy",
+    sd_name: str = "null_sd_by_size.npy",
+    meta_name: str = "null_meta.pkl",
+) -> None:
+    """`genemajor_path`/`*_name` let this be re-run against a residualized
+    array without duplicating this file -- see `cell_cycle.py` /
+    `rerun_stage4_residualized.py`."""
     gene_mask = np.load(SCRATCH / "gene_filter_mask.npy")
     n_genes = int(gene_mask.sum())
     chunk_bounds = [(i, min(i + CHUNK_SIZE, n_genes)) for i in range(0, n_genes, CHUNK_SIZE)]
@@ -64,7 +73,7 @@ def compute_null(max_workers: int = 16) -> None:
         for rep in range(N_REPLICATES):
             seed = hash((size, rep)) % (2**31)
             for ci, (start, end) in enumerate(chunk_bounds):
-                jobs.append((size, seed, start, end, ci))
+                jobs.append((size, seed, start, end, ci, genemajor_path))
 
     # e2_by_size[size] -> (N_REPLICATES, n_genes) array
     e2_by_size = {s: np.zeros((N_REPLICATES, n_genes), dtype=np.float32) for s in REPRESENTATIVE_SIZES}
@@ -89,9 +98,9 @@ def compute_null(max_workers: int = 16) -> None:
     null_mean = np.stack([e2_by_size[s].mean(axis=0) for s in REPRESENTATIVE_SIZES])  # (n_sizes, n_genes)
     null_sd = np.stack([e2_by_size[s].std(axis=0, ddof=1) for s in REPRESENTATIVE_SIZES])
 
-    np.save(SCRATCH / "null_mean_by_size.npy", null_mean)
-    np.save(SCRATCH / "null_sd_by_size.npy", null_sd)
-    with open(SCRATCH / "null_meta.pkl", "wb") as f:
+    np.save(SCRATCH / mean_name, null_mean)
+    np.save(SCRATCH / sd_name, null_sd)
+    with open(SCRATCH / meta_name, "wb") as f:
         pickle.dump({"sizes": REPRESENTATIVE_SIZES, "n_replicates": N_REPLICATES}, f)
 
 

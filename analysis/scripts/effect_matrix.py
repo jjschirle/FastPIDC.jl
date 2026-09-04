@@ -98,11 +98,11 @@ def energy_distance_batch(
 
 
 def _worker(args):
-    target, cell_indices, ntc_indices, chunk_start, chunk_end, chunk_id = args
+    target, cell_indices, ntc_indices, chunk_start, chunk_end, chunk_id, genemajor_path = args
     # Genes-major layout: a contiguous row-block read (fast, sequential), then
     # cell selection is fancy-indexing on an already-in-RAM small block instead
     # of scattered reads against the full 16 GB mmap.
-    Xg = np.load(X_GENEMAJOR_PATH, mmap_mode="r")
+    Xg = np.load(genemajor_path, mmap_mode="r")
     block = np.asarray(Xg[chunk_start:chunk_end, :])  # (chunk_genes, n_cells), contiguous read
     a = block[:, cell_indices].T  # (m, chunk_genes)
     b = block[:, ntc_indices].T  # (n, chunk_genes)
@@ -110,7 +110,16 @@ def _worker(args):
     return target, chunk_id, e2
 
 
-def compute_effect_matrix(max_workers: int = 16, chunk_size: int = 1500) -> None:
+def compute_effect_matrix(
+    max_workers: int = 16,
+    chunk_size: int = 1500,
+    genemajor_path: Path = X_GENEMAJOR_PATH,
+    out_name: str = "E_matrix.npy",
+    meta_name: str = "E_matrix_meta.pkl",
+) -> None:
+    """`genemajor_path`/`out_name`/`meta_name` let this be re-run against a
+    residualized array (see `cell_cycle.py` / `rerun_stage4_residualized.py`)
+    without duplicating this file."""
     targets_obs = pickle.load(open(SCRATCH / "obs_target_gene.pkl", "rb"))
     var_names = pickle.load(open(SCRATCH / "var_names.pkl", "rb"))
     gene_mask = np.load(SCRATCH / "gene_filter_mask.npy")
@@ -126,7 +135,7 @@ def compute_effect_matrix(max_workers: int = 16, chunk_size: int = 1500) -> None
     for g in target_list:
         cell_indices = np.where(targets_obs == g)[0]
         for ci, (start, end) in enumerate(chunk_bounds):
-            jobs.append((g, cell_indices, ntc_indices, start, end, ci))
+            jobs.append((g, cell_indices, ntc_indices, start, end, ci, genemajor_path))
 
     E = np.zeros((len(target_list), len(filtered_genes)), dtype=np.float32)
     target_to_row = {g: i for i, g in enumerate(target_list)}
@@ -144,8 +153,8 @@ def compute_effect_matrix(max_workers: int = 16, chunk_size: int = 1500) -> None
                 print(f"[{n_done}/{len(jobs)}] elapsed {time.time() - t0:.1f}s", flush=True)
     print(f"done in {time.time() - t0:.1f}s, {len(jobs)} jobs total")
 
-    np.save(SCRATCH / "E_matrix.npy", E)
-    with open(SCRATCH / "E_matrix_meta.pkl", "wb") as f:
+    np.save(SCRATCH / out_name, E)
+    with open(SCRATCH / meta_name, "wb") as f:
         pickle.dump({"target_list": target_list, "filtered_genes": filtered_genes}, f)
 
 

@@ -27,16 +27,22 @@ from statsmodels.stats.multitest import multipletests
 from effect_matrix import SCRATCH
 
 
-def load_all():
-    E = np.load(SCRATCH / "E_matrix.npy")
+def load_all(
+    e_matrix_name: str = "E_matrix.npy",
+    e_meta_name: str = "E_matrix_meta.pkl",
+    null_mean_name: str = "null_mean_by_size.npy",
+    null_sd_name: str = "null_sd_by_size.npy",
+    null_meta_name: str = "null_meta.pkl",
+):
+    E = np.load(SCRATCH / e_matrix_name)
     np.clip(E, 0, None, out=E)  # tiny negative floating-point noise near zero
-    meta = pickle.load(open(SCRATCH / "E_matrix_meta.pkl", "rb"))
+    meta = pickle.load(open(SCRATCH / e_meta_name, "rb"))
     target_list = meta["target_list"]
     genes = meta["filtered_genes"]
 
-    null_mean = np.load(SCRATCH / "null_mean_by_size.npy")
-    null_sd = np.load(SCRATCH / "null_sd_by_size.npy")
-    null_meta = pickle.load(open(SCRATCH / "null_meta.pkl", "rb"))
+    null_mean = np.load(SCRATCH / null_mean_name)
+    null_sd = np.load(SCRATCH / null_sd_name)
+    null_meta = pickle.load(open(SCRATCH / null_meta_name, "rb"))
     sizes = np.array(null_meta["sizes"], dtype=np.float64)
 
     targets_obs = pickle.load(open(SCRATCH / "obs_target_gene.pkl", "rb"))
@@ -64,8 +70,13 @@ def interpolate_null(n: int, sizes: np.ndarray, null_mean: np.ndarray, null_sd: 
     return interp(null_mean), interp(null_sd)
 
 
-def calibrate():
-    E, target_list, genes, null_mean, null_sd, sizes, n_pert = load_all()
+def calibrate(
+    load_kwargs: dict | None = None,
+    q_name: str = "E_qvalues.npy",
+    z_name: str = "E_zscores.npy",
+    kout_name: str = "k_out.csv",
+):
+    E, target_list, genes, null_mean, null_sd, sizes, n_pert = load_all(**(load_kwargs or {}))
     gi = {g: i for i, g in enumerate(genes)}
 
     Z = np.zeros_like(E)
@@ -77,8 +88,8 @@ def calibrate():
     q_flat = multipletests(p.ravel(), method="fdr_bh")[1]
     Q = q_flat.reshape(p.shape)
 
-    np.save(SCRATCH / "E_qvalues.npy", Q)
-    np.save(SCRATCH / "E_zscores.npy", Z)
+    np.save(SCRATCH / q_name, Q)
+    np.save(SCRATCH / z_name, Z)
 
     # measured effective out-degree per target, excluding the target's own gene
     k_out = {}
@@ -90,7 +101,7 @@ def calibrate():
         k_out[g] = int(sig.sum())
 
     df = pd.DataFrame({"target": target_list, "n_pert": [n_pert[g] for g in target_list], "k_out": [k_out[g] for g in target_list]})
-    df.to_csv(SCRATCH / "k_out.csv", index=False)
+    df.to_csv(SCRATCH / kout_name, index=False)
 
     print("=== Checkpoint D0 (companion plan): measured k^out_g spread ===")
     print(df["k_out"].describe())
