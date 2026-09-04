@@ -143,8 +143,16 @@ Loaded automatically when `using CUDA` alongside `FastPIDC`.
 
 ```@docs
 FastPIDCCUDAExt
-FastPIDCCUDAExt.joint_counts_kernel_chunked!
-FastPIDCCUDAExt.mi_si_kernel_chunked!
-FastPIDCCUDAExt.puc_accumulation_kernel_chunked!
-FastPIDCCUDAExt.bayesian_blocks_dp_kernel!
+FastPIDCCUDAExt._kernel_source_path
+FastPIDCCUDAExt._compile_ptx
+FastPIDCCUDAExt._get_module
+FastPIDCCUDAExt._bb_kernel_name
+FastPIDC.bayesian_blocks_cuda_available
+FastPIDC.solve_bayesian_blocks_cuda
 ```
+
+The GPU kernels themselves (`joint_counts_kernel`, `mi_si_kernel`,
+`puc_accumulation_kernel`) are plain CUDA C, not Julia, so they aren't
+Julia docstrings; see the header comments in
+`python/src/fastpidc/kernels/pidc_kernels.cu`, the canonical source shared
+with the Python package.

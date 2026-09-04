@@ -155,17 +155,45 @@ if CUDA.functional()
         end
 
         @testset "Bayesian-block backtracking edge cases" begin
-            @test cuda_ext._change_points_from_last(UInt8[1], 1, 1) ==
+            # The shared CUDA C kernel writes 0-based predecessor indices, so
+            # these raw back-pointer arrays use the device encoding: a valid
+            # entry for state `s` lies in 0:(s-1). The resulting 1-based edge
+            # paths are unchanged.
+            @test cuda_ext._change_points_from_last(UInt8[0], 1, 1) ==
                   Int64[1, 2]
-            @test cuda_ext._change_points_from_last(UInt8[1, 2], 1, 2) ==
+            @test cuda_ext._change_points_from_last(UInt8[0, 1], 1, 2) ==
                   Int64[1, 2, 3]
-            @test cuda_ext._change_points_from_last(UInt8[1, 1], 1, 2) ==
+            @test cuda_ext._change_points_from_last(UInt8[0, 0], 1, 2) ==
                   Int64[1, 3]
+            # A back-pointer that points forward past its own state.
             @test_throws ArgumentError cuda_ext._change_points_from_last(
-                UInt8[1, 0],
+                UInt8[0, 2],
                 1,
                 2,
             )
+        end
+
+        @testset "Shared kernel entry point selection" begin
+            @test cuda_ext._bb_kernel_name(UInt8, UInt8) ==
+                  "bayesian_blocks_dp_u8_u8"
+            @test cuda_ext._bb_kernel_name(UInt32, UInt16) ==
+                  "bayesian_blocks_dp_u32_u16"
+            @test cuda_ext._bb_kernel_name(UInt64, UInt64) ==
+                  "bayesian_blocks_dp_u64_u64"
+            # U_g never exceeds the observation count, so a back-pointer type
+            # wider than the prefix-count type is not instantiated.
+            @test_throws ArgumentError cuda_ext._bb_kernel_name(UInt8, UInt16)
+            @test_throws ArgumentError cuda_ext._bb_kernel_name(Int32, UInt8)
+
+            # Every advertised entry point must exist in the compiled module.
+            md = cuda_ext._get_module()
+            for count_type in (UInt8, UInt16, UInt32, UInt64),
+                index_type in (UInt8, UInt16, UInt32, UInt64)
+
+                sizeof(index_type) <= sizeof(count_type) || continue
+                name = cuda_ext._bb_kernel_name(count_type, index_type)
+                @test CUDA.CuFunction(md, name) isa CUDA.CuFunction
+            end
         end
 
         @testset "Lightweight U_g bucketing and batching" begin

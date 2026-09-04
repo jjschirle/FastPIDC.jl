@@ -1,158 +1,96 @@
 """
     FastPIDCCUDAExt
 
-Package extension providing a CUDA-accelerated implementation of
-[`FastPIDC.compute_puc_full_cuda`](@ref), loaded automatically once
+Package extension providing CUDA-accelerated implementations of
+[`FastPIDC.compute_puc_full_cuda`](@ref) and
+[`FastPIDC.solve_bayesian_blocks_cuda`](@ref), loaded automatically once
 `using CUDA` makes the `CUDA` package available alongside `FastPIDC`.
-Selected by passing `config.backend = :cuda` (the default) to
-[`FastPIDC.compute_puc_full`](@ref).
+Selected by passing `config.backend = :cuda` and `config.bb_backend = :cuda`
+(both the default).
+
+Rather than maintaining a second, CUDA.jl-native copy of the kernels, this
+extension compiles and drives the single canonical kernel source shared with
+the Python package, `python/src/fastpidc/kernels/pidc_kernels.cu` (see that
+file's header comment for both algorithms). It is plain CUDA C, so it is
+compiled here with `nvcc` (required on `PATH` in addition to a functional
+GPU) into PTX for the active device's compute capability, then loaded with
+`CUDA.CuModule` and driven with `CUDA.cudacall` - the same kernels Python's
+`cuda` backend loads via `cupy.RawModule`.
 """
 module FastPIDCCUDAExt
 
 using FastPIDC
 using CUDA
 
-# --- Kernels ---
+# --- Shared kernel source: compile once per (session, GPU architecture) ---
+
+const _MODULE_CACHE = Dict{String,CuModule}()
 
 """
-    joint_counts_kernel_chunked!(data, counts, n, m, k_bins, z_start, z_chunk_size)
+    _kernel_source_path() -> String
 
-CUDA kernel: for a chunk of `z_chunk_size` target genes starting at
-`z_start`, accumulate the joint bin-count histogram `counts[u, v, x,
-z_local]` (co-occurrences of bin `u` for gene `x` and bin `v` for gene
-`z_global = z_start + z_local - 1`) across all `m` samples in `data`. One
-GPU thread handles one `(x, z_local)` pair; `n` is the number of genes and
-`k_bins` the number of discretization bins.
+Path to the canonical CUDA kernel source, shared with the Python package.
+Resolved relative to this Julia package's root, since a git-based install
+(`Pkg.add(url = ...)`) clones the whole repository, `python/` included.
 """
-function joint_counts_kernel_chunked!(data, counts, n, m, k_bins, z_start, z_chunk_size)
-    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    z_local = (blockIdx().y - 1) * blockDim().y + threadIdx().y
-    
-    if x > n || z_local > z_chunk_size; return nothing; end
-    
-    z_global = z_start + z_local - 1
-    if z_global > n || x == z_global; return nothing; end
-    
-    # Each thread computes joint counts for pair (x, z_global). Derive the
-    # increment from the count buffer so UInt16/UInt32 storage remains generic.
-    count_increment = one(eltype(counts))
-    for s in 1:m
-        # Bin IDs may use a compact unsigned storage type on the GPU; widen
-        # them for bounds checks and native N-D indexing.
-        u = Int32(data[s, x])
-        v = Int32(data[s, z_global])
-        if u >= 1 && u <= k_bins && v >= 1 && v <= k_bins
-            counts[u, v, x, z_local] += count_increment
-        end
-    end
-
-    return nothing
+function _kernel_source_path()
+    path = joinpath(pkgdir(FastPIDC), "python", "src", "fastpidc", "kernels", "pidc_kernels.cu")
+    isfile(path) || error(
+        "Shared CUDA kernel source not found at $path. FastPIDC.jl's CUDA " *
+        "extension expects to find it relative to the package root (see " *
+        "the FastPIDCCUDAExt module docstring); if FastPIDC.jl was " *
+        "installed without the `python/` subdirectory, this backend is " *
+        "unavailable.",
+    )
+    return path
 end
 
 """
-    mi_si_kernel_chunked!(counts, marginals, mi_matrix, si_matrix, n, m, k_bins, z_start, z_chunk_size)
+    _compile_ptx(arch::String) -> String
 
-CUDA kernel: from the joint bin counts `counts` (as produced by
-[`joint_counts_kernel_chunked!`](@ref)) and per-gene marginal bin
-probabilities `marginals`, compute the mutual information
-`mi_matrix[x, z_global]` and the specific information
-`si_matrix[:, x, z_local]` of gene `x` with respect to target gene
-`z_global = z_start + z_local - 1`, for the chunk of `z_chunk_size` targets
-starting at `z_start`. One GPU thread handles one `(x, z_local)` pair; `n`
-is the number of genes, `m` the number of samples, and `k_bins` the number
-of discretization bins.
+Compile the shared kernel source to PTX text targeting virtual architecture
+`arch` (e.g. `"compute_89"`), using `nvcc`. Requires a CUDA toolkit
+installation with `nvcc` on `PATH`.
 """
-function mi_si_kernel_chunked!(counts, marginals, mi_matrix, si_matrix, n, m, k_bins, z_start, z_chunk_size)
-    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    z_local = (blockIdx().y - 1) * blockDim().y + threadIdx().y
-    
-    if x > n || z_local > z_chunk_size; return nothing; end
-    
-    z_global = z_start + z_local - 1
-    if z_global > n || x == z_global; return nothing; end
-    
-    inv_m = 1.0 / Float64(m)
-    mi_val = 0.0
-    
-    for v in 1:k_bins
-        p_z_v = marginals[v, z_global]
-        if p_z_v <= 0.0; continue; end
-        
-        si_v = 0.0f0 # Use Float32 for Specific Information buffer
-        for u in 1:k_bins
-            p_x_u = marginals[u, x]
-            if p_x_u <= 0.0; continue; end
-            
-            c_uv = counts[u, v, x, z_local]
-            p_uv = Float64(c_uv) * inv_m
+function _compile_ptx(arch::String)
+    nvcc = Sys.which("nvcc")
+    nvcc === nothing && error(
+        "The CUDA backend needs `nvcc` (from a CUDA toolkit installation) " *
+        "on PATH to compile the shared kernel source " *
+        "(python/src/fastpidc/kernels/pidc_kernels.cu); none was found. " *
+        "Install the CUDA toolkit, or use `config.backend = :cpu`.",
+    )
 
-            if p_uv > 0.0
-                mi_val += p_uv * log2(p_uv / (p_x_u * p_z_v))
-                p_u_cond_v = p_uv / p_z_v
-                si_v += Float64(p_u_cond_v * log2(p_u_cond_v / p_x_u))
-            end
+    src = _kernel_source_path()
+    mktempdir() do dir
+        ptx_path = joinpath(dir, "pidc_kernels.ptx")
+        cmd = `$nvcc --ptx -arch=$arch $src -o $ptx_path`
+        out = IOBuffer()
+        try
+            run(pipeline(cmd; stdout=out, stderr=out))
+        catch e
+            error("nvcc failed to compile $src:\n$(String(take!(out)))")
         end
-        si_matrix[v, x, z_local] = si_v
+        return read(ptx_path, String)
     end
-
-    mi_matrix[x, z_global] = mi_val
-    return nothing
 end
 
 """
-    puc_accumulation_kernel_chunked!(si_matrix, mi_matrix, puc_scores, marginals, n, k_bins, z_start, z_chunk_size)
+    _get_module() -> CuModule
 
-CUDA kernel: for each target gene `z_global` in the current chunk and each
-source gene `x`, accumulate the PUC contribution
-`puc_scores[x, z_global] += (MI(x, z_global) - redundancy(x, y, z_global)) /
-MI(x, z_global)` (clamped to be non-negative) summed over all other genes
-`y`, using specific information values from `si_matrix` and marginal
-probabilities from `marginals`. One GPU thread handles one `(x, z_local)`
-pair, looping internally over `y`; `n` is the number of genes and `k_bins`
-the number of discretization bins. Contributions still need to be
-symmetrized (`puc_scores[i,j] + puc_scores[j,i]`) by the caller, since each
-thread only writes `puc_scores[x, z_global]`.
+The compiled kernel module for the current device's compute capability,
+compiling (and caching, per architecture, for the life of the Julia
+session) on first use.
 """
-function puc_accumulation_kernel_chunked!(si_matrix, mi_matrix, puc_scores, marginals, n, k_bins, z_start, z_chunk_size)
-    x = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    z_local = (blockIdx().y - 1) * blockDim().y + threadIdx().y
-    
-    if x > n || z_local > z_chunk_size; return nothing; end
-    
-    z_global = z_start + z_local - 1
-    if z_global > n || x == z_global; return nothing; end
-    
-    mi_xz = mi_matrix[x, z_global]
-    if mi_xz <= 1e-12; return nothing; end
-    
-    local_puc = 0.0
-    # Y loop: to compute redundancy, we need SI for every other node Y with Z.
-    for y in 1:n
-        if y == x || y == z_global; continue; end
-        
-        redundancy = 0.0
-        for k in 1:k_bins
-            p_z_k = marginals[k, z_global]
-            if p_z_k <= 0.0; continue; end
-            
-            # Read from the Float64 SI matrix, convert back to Float64 for math
-            si_x = Float64(si_matrix[k, x, z_local])
-            si_y = Float64(si_matrix[k, y, z_local])
-            
-            redundancy += p_z_k * min(si_x, si_y)
-        end
-
-        score = (mi_xz - redundancy) / mi_xz
-        if isfinite(score) && score > 0.0
-            local_puc += score
-        end
+function _get_module()
+    cap = CUDA.capability(CUDA.device())
+    arch = "compute_$(cap.major)$(cap.minor)"
+    get!(_MODULE_CACHE, arch) do
+        CuModule(_compile_ptx(arch))
     end
-    
-    puc_scores[x, z_global] = local_puc
-    return nothing
 end
 
-# --- Host Implementation ---
+# --- Host implementation ---
 
 function _smallest_unsigned_type(max_value::Integer)
     max_value >= 0 || throw(ArgumentError("max_value must be nonnegative"))
@@ -168,43 +106,67 @@ function _smallest_unsigned_type(max_value::Integer)
     end
 end
 
-function _compute_puc_full_cuda_typed(
-    nodes,
-    config,
-    base,
-    ::Type{BinT},
-    ::Type{CountT},
-) where {BinT<:Integer,CountT<:Integer}
+"""
+    FastPIDC.compute_puc_full_cuda(nodes, config, base) -> (mi_scores, puc_scores)
+
+GPU implementation of [`FastPIDC.compute_puc_full`](@ref): computes the full
+pairwise MI matrix and pre-context PUC matrix for `nodes` on the GPU,
+processing genes along the target (`z`) axis in chunks (up to 256 genes at
+a time) sized to fit the GPU memory currently free, to bound device memory
+use even when the discretizer has picked a large number of bins (see the
+chunk-sizing comment in the implementation). Moves discretized data and
+marginal probabilities to the GPU once, then for each chunk launches the
+shared `joint_counts_kernel`, `mi_si_kernel` and `puc_accumulation_kernel`
+(see the `FastPIDCCUDAExt` module docstring) in sequence, symmetrizing the
+resulting PUC matrix before returning both matrices to the CPU.
+`config.verbose` enables progress printouts; `base` is currently unused
+(mutual information is always computed in base 2 on the GPU, matching the
+kernel source). Raises an `ErrorException` with a suggested remedy if even
+a single-gene chunk would not fit in the currently-free GPU memory.
+
+Device buffers use Julia's column-major layout with dimensions reversed
+relative to the kernel source's documented (row-major) shapes - e.g. a
+kernel-documented `(k_bins, n)` array is allocated here with Julia size
+`(n, k_bins)` - so that the flat in-memory layout the kernels index into
+with manual pointer arithmetic is identical in both languages, with no
+transposition needed at the call boundary.
+"""
+function FastPIDC.compute_puc_full_cuda(nodes, config, base)
+    md = _get_module()
+    joint_counts_kernel = CuFunction(md, "joint_counts_kernel")
+    mi_si_kernel = CuFunction(md, "mi_si_kernel")
+    puc_accumulation_kernel = CuFunction(md, "puc_accumulation_kernel")
+
     num_nodes = length(nodes)
     num_samples = length(nodes[1].binned_values)
     k_bins = maximum(n -> n.number_of_bins, nodes)
 
-    # Prepare static data on CPU and move to GPU.
-    data_cpu = Matrix{BinT}(undef, num_samples, num_nodes)
-    marginals_cpu = zeros(Float64, k_bins, num_nodes)
+    # Prepare static data on CPU and move to GPU. The shared CUDA C kernels use
+    # 0-indexed Int32 bin ids; FastPIDC.jl's bin ids are 1-indexed, so shift
+    # them down at this boundary.
+    data_cpu = zeros(Int32, num_nodes, num_samples)          # kernel shape (m, n), reversed
+    marginals_cpu = zeros(Float64, num_nodes, k_bins)       # kernel shape (k_bins, n), reversed
     for i = 1:num_nodes
-        data_cpu[:, i] .= nodes[i].binned_values
+        data_cpu[i, :] .= Int32.(nodes[i].binned_values) .- Int32(1)
         p = nodes[i].probabilities
-        marginals_cpu[1:length(p), i] .= Float64.(p)
+        marginals_cpu[i, 1:length(p)] .= Float64.(p)
     end
 
     data_gpu = CuArray(data_cpu)
     marginals_gpu = CuArray(marginals_cpu)
 
-    # Global output matrices.
+    # Global output matrices (kernel shape (n, n); square, so no reversal needed).
     puc_scores_gpu = CUDA.zeros(Float64, num_nodes, num_nodes)
     mi_matrix_gpu = CUDA.zeros(Float64, num_nodes, num_nodes)
 
-    # Chunk configuration: `counts_chunk_gpu`/`si_chunk_gpu` scale with
-    # k_bins^2 * num_nodes * chunk_size and k_bins * num_nodes * chunk_size,
-    # respectively. Size the chunk to fit the GPU memory currently free rather
-    # than always requesting a fixed chunk size of 256. Because BB_prefix uses
-    # the smallest exact joint-count type, account for CountT rather than
-    # assuming Int32 storage.
+    # Chunked intermediates scale with k_bins^2 * num_nodes * chunk_size for
+    # joint counts and k_bins * num_nodes * chunk_size for specific information.
+    # Size the target-gene chunk from currently-free memory rather than always
+    # allocating a fixed 256-gene chunk.
     bytes_per_chunk_col =
-        k_bins^2 * num_nodes * sizeof(CountT) +  # counts_chunk_gpu
-        k_bins * num_nodes * sizeof(Float64)     # si_chunk_gpu
-    free_bytes, _ = CUDA.memory_info()
+        k_bins^2 * num_nodes * sizeof(Int32) +  # counts_chunk_gpu
+        k_bins * num_nodes * sizeof(Float64)    # si_chunk_gpu
+    free_bytes = Int(CUDA.free_memory())
     safety_factor = 0.8  # headroom for fixed buffers + allocator overhead/fragmentation
     max_chunk_size = floor(Int, free_bytes * safety_factor / bytes_per_chunk_col)
     chunk_size = clamp(max_chunk_size, 1, min(256, num_nodes))
@@ -222,9 +184,10 @@ function _compute_puc_full_cuda_typed(
         )
     end
 
-    # Chunked intermediate buffers, pre-allocated once.
-    counts_chunk_gpu = CUDA.zeros(CountT, k_bins, k_bins, num_nodes, chunk_size)
-    si_chunk_gpu = CUDA.zeros(Float64, k_bins, num_nodes, chunk_size)
+    # Chunked intermediate buffers (pre-allocated once), with dimensions
+    # reversed to preserve the row-major flat layout expected by the CUDA C kernels.
+    counts_chunk_gpu = CUDA.zeros(Int32, chunk_size, num_nodes, k_bins, k_bins)
+    si_chunk_gpu = CUDA.zeros(Float64, chunk_size, num_nodes, k_bins)
 
     if config.verbose
         println(
@@ -236,63 +199,63 @@ function _compute_puc_full_cuda_typed(
             "(approx. $(ceil(Int, num_nodes / chunk_size)) iterations), " *
             "sized to fit $(round(free_bytes / 2^30, digits = 2)) GiB free GPU memory",
         )
-        println(
-            "[FastPIDC] GPU storage types: bin IDs=$(BinT) (max bins=$k_bins), " *
-            "joint counts=$(CountT) (cells=$num_samples)",
-        )
     end
 
-    # Iterate over the Z-axis in chunks
-    for z_start in 1:chunk_size:num_nodes
-        z_end = min(z_start + chunk_size - 1, num_nodes)
-        z_curr_chunk_size = z_end - z_start + 1
+    threads = (16, 16)
 
-        # Wipe the intermediate buffers clean before the next chunk.
-        CUDA.fill!(counts_chunk_gpu, zero(CountT))
-        CUDA.fill!(si_chunk_gpu, 0.0)
+    # Iterate over the Z-axis in chunks. The shared kernels use 0-based target
+    # indices, so convert z_start at the call boundary.
+    for z_start_1 in 1:chunk_size:num_nodes
+        z_start = z_start_1 - 1
+        z_end = min(z_start_1 + chunk_size - 1, num_nodes)
+        z_curr_chunk_size = z_end - z_start_1 + 1
 
-        threads = (16, 16)
+        CUDA.fill!(counts_chunk_gpu, Int32(0))
+        CUDA.fill!(si_chunk_gpu, Float64(0))
+
         blocks = (cld(num_nodes, 16), cld(z_curr_chunk_size, 16))
 
-        @cuda threads=threads blocks=blocks joint_counts_kernel_chunked!(
-            data_gpu,
-            counts_chunk_gpu,
-            Int32(num_nodes),
-            Int32(num_samples),
-            Int32(k_bins),
-            Int32(z_start),
-            Int32(z_curr_chunk_size),
+        cudacall(
+            joint_counts_kernel,
+            (CuPtr{Cint}, CuPtr{Cint}, Cint, Cint, Cint, Cint, Cint),
+            data_gpu, counts_chunk_gpu,
+            Cint(num_nodes), Cint(num_samples), Cint(k_bins),
+            Cint(z_start), Cint(z_curr_chunk_size);
+            blocks=blocks, threads=threads,
         )
 
-        @cuda threads=threads blocks=blocks mi_si_kernel_chunked!(
-            counts_chunk_gpu,
-            marginals_gpu,
-            mi_matrix_gpu,
-            si_chunk_gpu,
-            Int32(num_nodes),
-            Int32(num_samples),
-            Int32(k_bins),
-            Int32(z_start),
-            Int32(z_curr_chunk_size),
+        cudacall(
+            mi_si_kernel,
+            (
+                CuPtr{Cint}, CuPtr{Cdouble}, CuPtr{Cdouble}, CuPtr{Cdouble},
+                Cint, Cint, Cint, Cint, Cint,
+            ),
+            counts_chunk_gpu, marginals_gpu, mi_matrix_gpu, si_chunk_gpu,
+            Cint(num_nodes), Cint(num_samples), Cint(k_bins),
+            Cint(z_start), Cint(z_curr_chunk_size);
+            blocks=blocks, threads=threads,
         )
 
-        @cuda threads=threads blocks=blocks puc_accumulation_kernel_chunked!(
-            si_chunk_gpu,
-            mi_matrix_gpu,
-            puc_scores_gpu,
-            marginals_gpu,
-            Int32(num_nodes),
-            Int32(k_bins),
-            Int32(z_start),
-            Int32(z_curr_chunk_size),
+        cudacall(
+            puc_accumulation_kernel,
+            (
+                CuPtr{Cdouble}, CuPtr{Cdouble}, CuPtr{Cdouble}, CuPtr{Cdouble},
+                Cint, Cint, Cint, Cint,
+            ),
+            si_chunk_gpu, mi_matrix_gpu, puc_scores_gpu, marginals_gpu,
+            Cint(num_nodes), Cint(k_bins),
+            Cint(z_start), Cint(z_curr_chunk_size);
+            blocks=blocks, threads=threads,
         )
     end
 
-    # Copy results back
-    puc_scores_cpu = Array(puc_scores_gpu)
-    mi_matrix_cpu = Array(mi_matrix_gpu)
+    # Kernels write row-major (x, z) into a Julia array whose dimensions were
+    # reversed above, so transpose the square outputs back to Julia's convention.
+    mi_matrix_cpu = permutedims(Array(mi_matrix_gpu))
+    puc_scores_cpu = permutedims(Array(puc_scores_gpu))
 
-    # Symmetrize PUC scores
+    # Symmetrize PUC scores: each ordered pair contains one directional
+    # contribution from the shared kernel.
     for i = 1:num_nodes
         for j = (i+1):num_nodes
             val = puc_scores_cpu[i, j] + puc_scores_cpu[j, i]
@@ -304,196 +267,51 @@ function _compute_puc_full_cuda_typed(
     return mi_matrix_cpu, puc_scores_cpu
 end
 
-"""
-    FastPIDC.compute_puc_full_cuda(nodes, config, base) -> (mi_scores, puc_scores)
-
-GPU implementation of [`FastPIDC.compute_puc_full`](@ref): computes the full
-pairwise MI matrix and pre-context PUC matrix for `nodes` on the GPU,
-processing genes along the target (`z`) axis in chunks (up to 256 genes at
-a time) sized to fit the GPU memory currently free, to bound device memory
-use even when the discretizer has picked a large number of bins (see the
-chunk-sizing comment in the implementation). Moves discretized data and
-marginal probabilities to the GPU once, then for each chunk launches
-[`joint_counts_kernel_chunked!`](@ref), [`mi_si_kernel_chunked!`](@ref) and
-[`puc_accumulation_kernel_chunked!`](@ref) in sequence, symmetrizing the
-resulting PUC matrix before returning both matrices to the CPU.
-`config.verbose` enables progress printouts; `base` is currently unused
-(mutual information is always computed in base 2 on the GPU path). Raises
-an `ErrorException` with a suggested remedy if even a single-gene chunk
-would not fit in the currently-free GPU memory.
-"""
-function FastPIDC.compute_puc_full_cuda(nodes, config, base)
-    num_samples = length(nodes[1].binned_values)
-    k_bins = maximum(n -> n.number_of_bins, nodes)
-
-    # Bin IDs only need to represent the largest per-gene bin index.
-    BinT = _smallest_unsigned_type(k_bins)
-
-    # A joint count can reach the total number of cells. Choose the smallest
-    # exact unsigned type that can hold num_samples, guarding against overflow
-    # as datasets with larger cell counts are processed.
-    CountT = _smallest_unsigned_type(num_samples)
-
-    return _compute_puc_full_cuda_typed(nodes, config, base, BinT, CountT)
-end
-
-
 # --- Bayesian-block CUDA backend -------------------------------------------
 
 FastPIDC.bayesian_blocks_cuda_available() = CUDA.functional()
 
-# Deterministic comparison used by the Bayesian Blocks reduction: higher
-# score wins, with exact ties resolved in favor of the smaller candidate index.
-@inline function _bb_take_other(
-    other_score::Float64,
-    other_i::Int32,
-    current_score::Float64,
-    current_i::Int32,
-)::Bool
-    return other_score > current_score ||
-           (other_score == current_score && other_i < current_i)
-end
-
 """
-    bayesian_blocks_dp_kernel!(...)
+    _bb_kernel_name(CountT, IndexT) -> String
 
-Assign one CUDA block to each gene. Endpoints `K` remain sequential because
-`best[K]` depends on earlier endpoints, while threads within the block evaluate
-candidate starts `i <= K` in parallel. The reduction uses a deterministic
-first-maximum rule: higher score wins, and exact ties choose the smaller `i`.
+Entry point in the shared kernel source for the given prefix-count and
+back-pointer element types. CUDA C has no generics, so `pidc_kernels.cu`
+macro-generates one `extern "C"` kernel per valid type pair and the host
+selects by name.
 """
-function bayesian_blocks_dp_kernel!(
-    prefix_counts::CuDeviceArray{CountT,1},
-    block_lengths::CuDeviceArray{Float64,1},
-    state_offsets::CuDeviceArray{Int64,1},
-    block_offsets::CuDeviceArray{Int64,1},
-    unique_counts::CuDeviceArray{Int32,1},
-    best::CuDeviceArray{Float64,1},
-    last::CuDeviceArray{IndexT,1},
-    final_scores::CuDeviceArray{Float64,1},
-    priors::CuDeviceArray{Float64,1},
-) where {CountT<:Unsigned,IndexT<:Unsigned}
-    gene = Int32(blockIdx().x)
-    tid = Int32(threadIdx().x)
-    nthreads = Int32(blockDim().x)
-    lane = ((tid - 1) & Int32(31)) + 1
-    warp = ((tid - 1) >>> 5) + 1
-    nwarps = nthreads >>> 5
+function _bb_kernel_name(
+    ::Type{CountT},
+    ::Type{IndexT},
+) where {CountT<:Integer,IndexT<:Integer}
+    suffixes = Dict{DataType,String}(
+        UInt8 => "u8",
+        UInt16 => "u16",
+        UInt32 => "u32",
+        UInt64 => "u64",
+    )
 
-    # Keep one candidate per thread and one reduced candidate per warp. The
-    # reduction uses shared memory rather than generic shuffle helpers, keeping
-    # device dispatch fully concrete while requiring only two block barriers.
-    thread_scores = CuStaticSharedArray(Float64, 256)
-    thread_indices = CuStaticSharedArray(Int32, 256)
-    warp_scores = CuStaticSharedArray(Float64, 8)
-    warp_indices = CuStaticSharedArray(Int32, 8)
+    haskey(suffixes, CountT) || throw(
+        ArgumentError(
+            "Bayesian-block prefix counts must be an unsigned type the shared " *
+            "kernel provides (UInt8, UInt16, UInt32 or UInt64); got $CountT",
+        ),
+    )
+    haskey(suffixes, IndexT) || throw(
+        ArgumentError(
+            "Bayesian-block back-pointers must be an unsigned type the shared " *
+            "kernel provides (UInt8, UInt16, UInt32 or UInt64); got $IndexT",
+        ),
+    )
+    # U_g never exceeds the observation count, so only these pairs exist.
+    sizeof(IndexT) <= sizeof(CountT) || throw(
+        ArgumentError(
+            "Bayesian-block back-pointer type $IndexT is wider than the " *
+            "prefix-count type $CountT, which the shared kernel does not " *
+            "instantiate (U_g never exceeds the observation count)",
+        ),
+    )
 
-    @inbounds begin
-        state_start = state_offsets[gene]
-        block_start = block_offsets[gene]
-        n_unique = unique_counts[gene]
-
-        # Match the CPU reference's singleton behavior explicitly. The generic
-        # event-fitness expression has zero block width when U_g == 1, whereas a
-        # constant gene should deterministically return its two outer edges and
-        # an objective score of zero.
-        if n_unique == 1
-            if tid == 1
-                best[state_start] = 0.0
-                last[state_start] = one(IndexT)
-                final_scores[gene] = 0.0
-            end
-            return nothing
-        end
-
-        K = Int32(1)
-        while K <= n_unique
-            block_length_K1 = block_lengths[block_start + Int64(K)]
-            prefix_K = Float64(prefix_counts[state_start + Int64(K) - 1])
-            prior = priors[K]
-
-            local_best = -Inf
-            local_i = typemax(Int32)
-            i = tid
-            while i <= K
-                prefix_before = i == 1 ? 0.0 :
-                                Float64(prefix_counts[state_start + Int64(i) - 2])
-                count = prefix_K - prefix_before
-                width =
-                    block_lengths[block_start + Int64(i) - 1] - block_length_K1
-
-                fit = count * log(count / width) - prior
-                if i > 1
-                    fit += best[state_start + Int64(i) - 2]
-                end
-
-                if _bb_take_other(fit, i, local_best, local_i)
-                    local_best = fit
-                    local_i = i
-                end
-                i += nthreads
-            end
-
-            thread_scores[tid] = local_best
-            thread_indices[tid] = local_i
-            sync_threads()
-
-            # Each warp leader scans its 32 thread-local candidates in a fixed
-            # order. Exact ties still choose the smaller i, matching the CPU
-            # strict-`>` scan independently of launch size.
-            if lane == 1
-                warp_start = (warp - 1) * Int32(32) + 1
-                warp_end = warp_start + Int32(31)
-                warp_best = thread_scores[warp_start]
-                warp_i = thread_indices[warp_start]
-                slot = warp_start + 1
-                while slot <= warp_end
-                    other_score = thread_scores[slot]
-                    other_i = thread_indices[slot]
-                    if _bb_take_other(other_score, other_i, warp_best, warp_i)
-                        warp_best = other_score
-                        warp_i = other_i
-                    end
-                    slot += 1
-                end
-                warp_scores[warp] = warp_best
-                warp_indices[warp] = warp_i
-            end
-            sync_threads()
-
-            if tid == 1
-                block_best = warp_scores[1]
-                block_i = warp_indices[1]
-                warp_slot = Int32(2)
-                while warp_slot <= nwarps
-                    other_score = warp_scores[warp_slot]
-                    other_i = warp_indices[warp_slot]
-                    if _bb_take_other(other_score, other_i, block_best, block_i)
-                        block_best = other_score
-                        block_i = other_i
-                    end
-                    warp_slot += 1
-                end
-
-                state_index = state_start + Int64(K) - 1
-                best[state_index] = block_best
-                # IndexT was selected from max(U_g), so this modular conversion
-                # is exact and avoids a checked integer constructor in device code.
-                last[state_index] = block_i % IndexT
-                if K == n_unique
-                    final_scores[gene] = block_best
-                end
-            end
-
-            # `best[K]` is stored in global memory and is required by every
-            # thread during the next endpoint. Block synchronization makes that
-            # write visible before advancing K.
-            sync_threads()
-            K += 1
-        end
-    end
-
-    return nothing
+    return "bayesian_blocks_dp_$(suffixes[CountT])_$(suffixes[IndexT])"
 end
 
 function _bb_threads_for_max_u(max_u::Integer)
@@ -642,7 +460,9 @@ function _change_points_from_last(last_values, offset::Int, n::Int)
         1 <= state <= n || throw(
             ArgumentError("invalid Bayesian-block state $state while backtracking"),
         )
-        next_ind = Int(last_values[offset + state - 1])
+        # The shared kernel writes 0-based predecessors (see pidc_kernels.cu);
+        # shift back to Julia's 1-based candidate indices here.
+        next_ind = Int(last_values[offset + state - 1]) + 1
         1 <= next_ind <= state || throw(
             ArgumentError(
                 "invalid Bayesian-block back-pointer $next_ind for state $state",
@@ -673,24 +493,29 @@ function _solve_bb_cuda_batch_with_priors(
 
     prefix_gpu = CuArray(prefix_counts)
     block_gpu = CuArray(block_lengths)
-    state_offsets_gpu = CuArray(state_offsets)
-    block_offsets_gpu = CuArray(block_offsets)
+    # `state_offsets`/`block_offsets` are 1-based cursors for host-side slicing;
+    # the shared kernels index 0-based, so convert at the call boundary (as the
+    # PUC path does for `z_start`).
+    state_offsets_gpu = CuArray(state_offsets .- 1)
+    block_offsets_gpu = CuArray(block_offsets .- 1)
     unique_counts_gpu = CuArray(unique_counts)
     best_gpu = CUDA.zeros(Float64, length(prefix_counts))
     last_gpu = CUDA.zeros(IndexT, length(prefix_counts))
     final_scores_gpu = CUDA.zeros(Float64, length(problem_indices))
 
+    bb_kernel = CuFunction(_get_module(), _bb_kernel_name(CountT, IndexT))
+
     try
-        @cuda threads=threads blocks=length(problem_indices) bayesian_blocks_dp_kernel!(
-            prefix_gpu,
-            block_gpu,
-            state_offsets_gpu,
-            block_offsets_gpu,
-            unique_counts_gpu,
-            best_gpu,
-            last_gpu,
-            final_scores_gpu,
-            priors_gpu,
+        cudacall(
+            bb_kernel,
+            (
+                CuPtr{CountT}, CuPtr{Cdouble}, CuPtr{Int64}, CuPtr{Int64},
+                CuPtr{Cint}, CuPtr{Cdouble}, CuPtr{IndexT}, CuPtr{Cdouble},
+                CuPtr{Cdouble},
+            ),
+            prefix_gpu, block_gpu, state_offsets_gpu, block_offsets_gpu,
+            unique_counts_gpu, best_gpu, last_gpu, final_scores_gpu, priors_gpu;
+            blocks=length(problem_indices), threads=threads,
         )
 
         last_values = Array(last_gpu)

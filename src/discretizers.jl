@@ -270,7 +270,28 @@ struct BayesianBlocksSolution
 end
 
 # Placeholders extended by FastPIDCCUDAExt when CUDA.jl is loaded.
+
+"""
+    bayesian_blocks_cuda_available() -> Bool
+
+Whether the Bayesian-blocks CUDA backend is usable, defined by the
+`FastPIDCCUDAExt` package extension (loaded automatically when `using CUDA`
+and a functional GPU is available). Without the extension loaded, no method
+exists for this function; callers check `hasmethod` before calling it.
+"""
 function bayesian_blocks_cuda_available end
+
+"""
+    solve_bayesian_blocks_cuda(problems::Vector{BayesianBlocksProblem}, verbose::Bool)
+
+GPU implementation of the Bayesian-blocks dynamic program, defined by the
+`FastPIDCCUDAExt` package extension (loaded automatically when `using CUDA`
+and a functional GPU is available). Solves each `problems` entry
+independently, returning a `Vector{BayesianBlocksSolution}` in the same
+order. Calling this without the extension loaded raises a `MethodError`;
+callers check [`bayesian_blocks_cuda_available`](@ref) and the method's
+existence before dispatching to it.
+"""
 function solve_bayesian_blocks_cuda end
 
 """

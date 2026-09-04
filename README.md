@@ -2,6 +2,41 @@
 
 Documentation: https://meyer-lab.github.io/FastPIDC.jl/
 
+## Repository layout
+
+This repository holds two independent implementations of the same
+algorithms, released and versioned separately, kept in one place so they're
+easy to keep in sync:
+
+* **Julia** (`Project.toml`, `src/`, `ext/`, `test/`, `CLI_fastpidc.jl` at
+  the repository root) - the original package, `FastPIDC.jl`, registered
+  and installed the normal Julia way (`Pkg.add("FastPIDC")`). Its CI is
+  `.github/workflows/CI.yml`.
+* **Python** (`python/`) - `fastpidc`, a standalone NumPy/SciPy port (it
+  does not call out to Julia at runtime), managed with
+  [uv](https://docs.astral.sh/uv/). See `python/README.md` for
+  installation and usage. Its CI is `.github/workflows/python-CI.yml`,
+  scoped to only run on changes under `python/`.
+
+Each package has its own dependency manifest, test suite and CI workflow,
+so a change to one cannot break the other's build. `python/tests/` also
+cross-validates its results against a freshly run `FastPIDC.jl` (skipped
+automatically when `julia` isn't on `PATH`, e.g. in most CI runs) using the
+shared fixtures under `test/data/` and `test/baseline_outputs/` - these are
+Julia-agnostic edge lists, so both packages can use them without conflict.
+
+The two packages' GPU acceleration shares one implementation: the CUDA
+kernels live in
+[`python/src/fastpidc/kernels/pidc_kernels.cu`](python/src/fastpidc/kernels/pidc_kernels.cu),
+written in plain CUDA C so they can be compiled from either language.
+Python's `cuda` backend loads it via `cupy` (nvrtc); the Julia extension
+(`ext/FastPIDCCUDAExt`) compiles it with `nvcc` and drives it with
+`CUDA.jl`'s `cudacall` - see that file's header comment for both.
+
+When changing the algorithm, update both `src/`/`ext/` (Julia) and
+`python/src/fastpidc/` (Python and the shared kernel) together, and re-run
+`python/tests` with `julia` on `PATH` to confirm they still agree.
+
 ## Description
 
 NetworkInference is a package for inferring (undirected) networks, given a set of measurements for each node. The main output is the `InferredNetwork` type, which represents a fully connected, weighted network, where an edge's weight indicates the relative confidence of that edge existing in the true network. See also [Scope](#scope).

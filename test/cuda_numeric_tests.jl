@@ -16,7 +16,7 @@ if CUDA.functional()
         cuda_ext = Base.get_extension(FastPIDC, :FastPIDCCUDAExt)
         @test cuda_ext !== nothing
 
-        @testset "Compact GPU integer type selection" begin
+        @testset "Compact Bayesian Blocks GPU integer type selection" begin
             @test cuda_ext._smallest_unsigned_type(34) == UInt8
             @test cuda_ext._smallest_unsigned_type(255) == UInt8
             @test cuda_ext._smallest_unsigned_type(256) == UInt16
@@ -24,21 +24,6 @@ if CUDA.functional()
             @test cuda_ext._smallest_unsigned_type(65_535) == UInt16
             @test cuda_ext._smallest_unsigned_type(65_536) == UInt32
             @test_throws ArgumentError cuda_ext._smallest_unsigned_type(-1)
-        end
-
-        @testset "Compact storage matches Int32 reference" begin
-            mi_compact, puc_compact =
-                FastPIDC.compute_puc_full_cuda(nodes, config_cuda, 2)
-            mi_int32, puc_int32 = cuda_ext._compute_puc_full_cuda_typed(
-                nodes,
-                config_cuda,
-                2,
-                Int32,
-                Int32,
-            )
-
-            @test mi_compact == mi_int32
-            @test puc_compact == puc_int32
         end
 
         # We need to call the internal matrix generators directly, not just the Network wrapper
