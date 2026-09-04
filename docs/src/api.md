@@ -98,6 +98,16 @@ DiscretizeBayesianBlocks
 binedges
 ```
 
+### Bayesian Blocks internals
+
+```@docs
+FastPIDC.BayesianBlocksProblem
+FastPIDC.BayesianBlocksSolution
+FastPIDC.prepare_bayesian_blocks
+FastPIDC.solve_bayesian_blocks_cpu
+FastPIDC._build_nodes
+```
+
 ### Information measures
 
 ```@docs
@@ -136,4 +146,5 @@ FastPIDCCUDAExt
 FastPIDCCUDAExt.joint_counts_kernel_chunked!
 FastPIDCCUDAExt.mi_si_kernel_chunked!
 FastPIDCCUDAExt.puc_accumulation_kernel_chunked!
+FastPIDCCUDAExt.bayesian_blocks_dp_kernel!
 ```

@@ -342,14 +342,8 @@ end
 
 FastPIDC.bayesian_blocks_cuda_available() = CUDA.functional()
 
-"""
-    bayesian_blocks_dp_kernel!(...)
-
-Assign one CUDA block to each gene. Endpoints `K` remain sequential because
-`best[K]` depends on earlier endpoints, while threads within the block evaluate
-candidate starts `i <= K` in parallel. The reduction uses a deterministic
-first-maximum rule: higher score wins, and exact ties choose the smaller `i`.
-"""
+# Deterministic comparison used by the Bayesian Blocks reduction: higher
+# score wins, with exact ties resolved in favor of the smaller candidate index.
 @inline function _bb_take_other(
     other_score::Float64,
     other_i::Int32,
@@ -360,6 +354,14 @@ first-maximum rule: higher score wins, and exact ties choose the smaller `i`.
            (other_score == current_score && other_i < current_i)
 end
 
+"""
+    bayesian_blocks_dp_kernel!(...)
+
+Assign one CUDA block to each gene. Endpoints `K` remain sequential because
+`best[K]` depends on earlier endpoints, while threads within the block evaluate
+candidate starts `i <= K` in parallel. The reduction uses a deterministic
+first-maximum rule: higher score wins, and exact ties choose the smaller `i`.
+"""
 function bayesian_blocks_dp_kernel!(
     prefix_counts::CuDeviceArray{CountT,1},
     block_lengths::CuDeviceArray{Float64,1},
