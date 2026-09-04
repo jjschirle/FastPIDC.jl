@@ -27,14 +27,24 @@ class PIDCConfig:
     backend : computation backend for PUC/PIDC, either ``"cuda"`` (default,
         requires an optional GPU dependency and a functional GPU) or
         ``"cpu"``.
+    bb_backend : computation backend for the Bayesian-blocks dynamic program,
+        either ``"cuda"`` (default) or ``"cpu"``.
     discretizer, estimator : mirror the defaults used by :func:`get_nodes`.
     dump_mi_path, dump_puc_path : if set, the pairwise MI / pre-context PUC
         score matrix is written to ``<stem>_mi.npy`` / ``<stem>_puc.npy``
         (see :mod:`fastpidc.dump`).
     verbose : print progress information while inferring the network.
+
+    Notes
+    -----
+    The two backends fail differently, mirroring FastPIDC.jl: requesting
+    ``backend="cuda"`` without a usable GPU raises, whereas
+    ``bb_backend="cuda"`` warns and falls back to the CPU solver, since the two
+    Bayesian-block solvers produce the same bin edges either way.
     """
 
     backend: str = "cuda"
+    bb_backend: str = "cuda"
     discretizer: str = "bayesian_blocks"
     estimator: str = "maximum_likelihood"
     dump_mi_path: str | None = None
@@ -44,6 +54,8 @@ class PIDCConfig:
     def __post_init__(self) -> None:
         if self.backend not in _VALID_BACKENDS:
             raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {self.backend!r}")
+        if self.bb_backend not in _VALID_BACKENDS:
+            raise ValueError(f"bb_backend must be one of {_VALID_BACKENDS}, got {self.bb_backend!r}")
 
 
 @dataclass(frozen=True, slots=True)

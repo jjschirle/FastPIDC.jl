@@ -5,20 +5,31 @@ Ported from FastPIDC.jl's ``src/discretizers.jl`` (itself vendored from
 uniform-width, uniform-count and Bayesian blocks binning used by FastPIDC.
 
 Unlike the Julia implementation, bin ids here are **0-indexed**, to match
-Python/NumPy conventions.
+Python/NumPy conventions. Bayesian-block change points are likewise
+0-indexed into :attr:`BayesianBlocksProblem.edges`.
+
+This module holds the CPU Bayesian-block solver, which is the numerical
+reference for both packages. The GPU solver lives in :mod:`fastpidc.cuda`,
+which drives the same shared CUDA kernel FastPIDC.jl uses.
 """
 
 from __future__ import annotations
 
+import warnings
+from dataclasses import dataclass
+
 import numpy as np
 
 __all__ = [
+    "BayesianBlocksProblem",
+    "BayesianBlocksSolution",
     "LinearDiscretizer",
     "binedges_bayesian_blocks",
     "binedges_uniform_count",
     "binedges_uniform_width",
     "get_bin_ids",
-    "get_bin_ids_zero_as_own_bin",
+    "prepare_bayesian_blocks",
+    "solve_bayesian_blocks_cpu",
 ]
 
 
@@ -94,60 +105,161 @@ def binedges_uniform_count(data: np.ndarray, nbins: int) -> np.ndarray:
     return edges
 
 
-def binedges_bayesian_blocks(data: np.ndarray) -> np.ndarray:
-    """Bayesian-blocks bin edges for ``data``.
+# --- Bayesian blocks -------------------------------------------------------
+#
+# Histogram variant of the algorithm in Scargle (2012): event data are sorted,
+# then binned by maximizing a fitness function via dynamic programming, so both
+# the number and the placement of bins are chosen adaptively. Ported from the
+# vendored implementation in FastPIDC.jl's ``discretizers.jl`` (originally by
+# Michael P.H. Stumpf and T. Chan, based on Jake Vanderplas' Python code).
+#
+# Like the Julia implementation, preparation (sorting and unique-value
+# compression, which is backend-independent) is separated from the dynamic
+# program itself, so the two stages can be tested and compared in isolation.
+#
+# References
+# ----------
+# Scargle 2012: http://adsabs.harvard.edu/abs/2012arXiv1207.5578S
 
-    Follows the histogram variant of the algorithm in Scargle (2012): event
-    data are sorted, then binned by maximizing a fitness function via
-    dynamic programming. The number and placement of bins is chosen
-    adaptively. Ported from the vendored implementation in
-    ``discretizers.jl`` (originally by Michael P.H. Stumpf and T. Chan,
-    based on the Python implementation of Jake Vanderplas).
 
-    References
+@dataclass(frozen=True, slots=True)
+class BayesianBlocksProblem:
+    """Prepared inputs for the Bayesian-block dynamic program.
+
+    Attributes
     ----------
-    Scargle 2012: http://adsabs.harvard.edu/abs/2012arXiv1207.5578S
+    edges : ``(n_unique + 1,)`` candidate bin edges: the smallest observed
+        value, the midpoints between consecutive unique values, and the
+        largest observed value.
+    prefix_counts : ``(n_unique,)`` cumulative multiplicities, so
+        ``prefix_counts[i]`` is how many observations are ``<=`` the
+        ``i``-th unique value. Stored as float64 (they are exact integers
+        well below 2**53) so the dynamic program needs no casts.
+    """
+
+    edges: np.ndarray
+    prefix_counts: np.ndarray
+
+
+@dataclass(frozen=True, slots=True)
+class BayesianBlocksSolution:
+    """Selected change points and the final dynamic-program objective value.
+
+    Attributes
+    ----------
+    change_points : 0-indexed positions into :attr:`BayesianBlocksProblem.edges`.
+    score : the dynamic program's objective value at the last endpoint.
+    """
+
+    change_points: np.ndarray
+    score: float
+
+
+def prepare_bayesian_blocks(data: np.ndarray) -> BayesianBlocksProblem:
+    """Sort one node's observations, collapse repeated values, and build the
+    prefix-count representation used by the dynamic program.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` is empty.
     """
     sorted_data = np.sort(np.ravel(np.asarray(data, dtype=np.float64)))
-    unique_data, counts = np.unique(sorted_data, return_counts=True)
-    n = unique_data.size
-    nn_vec = counts.astype(np.float64)
+    m = sorted_data.size
+    if m == 0:
+        raise ValueError("Bayesian blocks requires at least one observation")
 
+    # One pass over the sorted values yields both the unique values and, for
+    # free, their cumulative multiplicities: each run boundary is exactly the
+    # number of observations at or below the preceding unique value.
+    boundaries = np.flatnonzero(sorted_data[1:] != sorted_data[:-1]) + 1
+    run_starts = np.concatenate(([0], boundaries))
+    unique_data = sorted_data[run_starts]
+    prefix_counts = np.concatenate((boundaries, [m])).astype(np.float64)
+
+    n = unique_data.size
     edges = np.empty(n + 1, dtype=np.float64)
     edges[0] = unique_data[0]
     edges[1:-1] = 0.5 * (unique_data[:-1] + unique_data[1:])
     edges[-1] = unique_data[-1]
-    block_length = unique_data[-1] - edges
 
-    count_vec = np.zeros(n, dtype=np.float64)
+    return BayesianBlocksProblem(edges, prefix_counts)
+
+
+def solve_bayesian_blocks_cpu(problem: BayesianBlocksProblem) -> BayesianBlocksSolution:
+    """Solve one prepared Bayesian-block problem with the exact prefix-count
+    dynamic program.
+
+    Prefix counts let each candidate block's observation count be recovered in
+    O(1), instead of maintaining a running count vector. The counts are exact
+    integers in float64, so the fitness values - and the first-maximum
+    tie-breaking that follows from them - are bit-identical to FastPIDC.jl's
+    reference solver.
+    """
+    prefix_counts = problem.prefix_counts
+    n = prefix_counts.size
+
+    if n == 1:
+        # A constant node: its two outer edges coincide, so the generic
+        # fitness expression would divide by a zero-width block. Return the
+        # degenerate two-edge partition explicitly, as the Julia reference does.
+        return BayesianBlocksSolution(np.array([0, 1], dtype=np.int64), 0.0)
+
+    block_length = problem.edges[-1] - problem.edges
+    # counts_before[i] is the cumulative count strictly before candidate start
+    # i, so a block [i, K] holds prefix_counts[K] - counts_before[i] points.
+    counts_before = np.empty(n, dtype=np.float64)
+    counts_before[0] = 0.0
+    counts_before[1:] = prefix_counts[:-1]
+
     best = np.zeros(n, dtype=np.float64)
     last = np.zeros(n, dtype=np.int64)
 
-    for k in range(n):  # K = k + 1 in 1-indexed terms
-        block_length_k1 = block_length[k + 1]
-        widths = block_length[: k + 1] - block_length_k1
-        count_vec[: k + 1] += nn_vec[k]
+    for k in range(n):  # endpoint K = k + 1 in the reference's 1-indexed terms
+        counts = prefix_counts[k] - counts_before[: k + 1]
+        widths = block_length[: k + 1] - block_length[k + 1]
 
         # Prior (eq. 21) and fitness function (eq. 19) from Scargle 2012.
         prior = 4 - np.log(73.53 * 0.05 * ((k + 1) ** -0.478))
-        fit_vec = count_vec[: k + 1] * np.log(count_vec[: k + 1] / widths) - prior
-        if k > 0:
-            fit_vec[1:] += best[:k]
+        fitness = counts * np.log(counts / widths) - prior
+        fitness[1:] += best[:k]
 
-        i_max = int(np.argmax(fit_vec))
-        last[k] = i_max  # 0-indexed predecessor
-        best[k] = fit_vec[i_max]
+        # np.argmax returns the first maximum, matching the reference scan's
+        # strict `>` comparison.
+        i_max = int(np.argmax(fitness))
+        last[k] = i_max
+        best[k] = fitness[i_max]
 
-    change_points = []
-    ind = n  # 1-indexed "n + 1" position, tracked as an exclusive index
+    # The maximal partition places every unique value in its own block, so the
+    # backtracked path can hold up to n + 1 edge indices; reserve that many and
+    # fill from the end.
+    change_points = np.empty(n + 1, dtype=np.int64)
+    cursor = n + 1
+    ind = n
     while True:
-        change_points.append(ind)
+        cursor -= 1
+        change_points[cursor] = ind
         if ind == 0:
             break
-        ind = last[ind - 1]
-    change_points.reverse()
+        ind = int(last[ind - 1])
 
-    return edges[change_points]
+    return BayesianBlocksSolution(change_points[cursor:], float(best[-1]))
+
+
+def binedges_bayesian_blocks(data: np.ndarray) -> np.ndarray:
+    """Bayesian-blocks bin edges for ``data``.
+
+    Convenience wrapper around :func:`prepare_bayesian_blocks` and
+    :func:`solve_bayesian_blocks_cpu`.
+    """
+    problem = prepare_bayesian_blocks(data)
+    solution = solve_bayesian_blocks_cpu(problem)
+    return problem.edges[solution.change_points]
+
+
+def _encode_uniform_width(values: np.ndarray, number_of_bins: int) -> tuple[np.ndarray, int]:
+    edges = binedges_uniform_width(values, number_of_bins)
+    return LinearDiscretizer(edges).encode(values), number_of_bins
 
 
 def get_bin_ids_zero_as_own_bin(values: np.ndarray, number_of_bins: int) -> tuple[np.ndarray, int]:
@@ -195,9 +307,9 @@ def get_bin_ids(values: np.ndarray, mode: str, number_of_bins: int) -> tuple[np.
     ----------
     values : array of raw (continuous) data values.
     mode : one of ``"bayesian_blocks"``, ``"uniform_width"``,
-        ``"uniform_count"``, ``"zero_as_own_bin"`` or ``"binarize"``. Falls
-        back to ``"uniform_width"`` if ``mode`` is unrecognized, or if the
-        requested method fails on this data.
+        ``"uniform_count"`` or ``"binarize"``. Falls back to
+        ``"uniform_width"`` (with a :class:`RuntimeWarning`) if ``mode`` is
+        unrecognized, or if the requested method fails on this data.
     number_of_bins : number of bins to use; ignored (and overwritten in the
         return value) when ``mode == "bayesian_blocks"``.
 
@@ -216,16 +328,15 @@ def get_bin_ids(values: np.ndarray, mode: str, number_of_bins: int) -> tuple[np.
         return np.where(values == 0, 0, 1).astype(np.int64), 2
 
     if mode == "uniform_width":
-        edges = binedges_uniform_width(values, number_of_bins)
-        return LinearDiscretizer(edges).encode(values), number_of_bins
+        return _encode_uniform_width(values, number_of_bins)
 
     if mode == "uniform_count":
         try:
             edges = binedges_uniform_count(values, number_of_bins)
-            return LinearDiscretizer(edges).encode(values), number_of_bins
         except ValueError:
-            edges = binedges_uniform_width(values, number_of_bins)
-            return LinearDiscretizer(edges).encode(values), number_of_bins
+            warnings.warn("Uniform count failed, fell back to uniform width", RuntimeWarning, stacklevel=2)
+            return _encode_uniform_width(values, number_of_bins)
+        return LinearDiscretizer(edges).encode(values), number_of_bins
 
     if mode == "zero_as_own_bin":
         return get_bin_ids_zero_as_own_bin(values, number_of_bins)
@@ -233,10 +344,11 @@ def get_bin_ids(values: np.ndarray, mode: str, number_of_bins: int) -> tuple[np.
     if mode == "bayesian_blocks":
         try:
             edges = binedges_bayesian_blocks(values)
-            return LinearDiscretizer(edges).encode(values), edges.size - 1
+            discretizer = LinearDiscretizer(edges)
         except ValueError:
-            edges = binedges_uniform_width(values, number_of_bins)
-            return LinearDiscretizer(edges).encode(values), number_of_bins
+            warnings.warn("Bayesian blocks failed, fell back to uniform width", RuntimeWarning, stacklevel=2)
+            return _encode_uniform_width(values, number_of_bins)
+        return discretizer.encode(values), discretizer.nbins
 
-    edges = binedges_uniform_width(values, number_of_bins)
-    return LinearDiscretizer(edges).encode(values), number_of_bins
+    warnings.warn(f"Discretizer {mode!r} doesn't exist, fell back to uniform width", RuntimeWarning, stacklevel=2)
+    return _encode_uniform_width(values, number_of_bins)

@@ -63,7 +63,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--n_bins", type=int, default=10, help="Number of bins (ignored by bayesian_blocks). Default: 10"
     )
     parser.add_argument("--base", type=int, default=2, help="Log base for MI (2, e-like int, 10). Default: 2")
-    parser.add_argument("--backend", default="cuda", choices=("cuda", "cpu"), help="Default: cuda")
+    parser.add_argument("--backend", default="cuda", choices=("cuda", "cpu"), help="PUC/PIDC backend. Default: cuda")
+    parser.add_argument(
+        "--bb-backend",
+        default="cuda",
+        choices=("cuda", "cpu"),
+        help="Bayesian-blocks backend. Default: cuda",
+    )
     parser.add_argument("--output-format", default="tsv", choices=("tsv", "npy"), help="Default: tsv")
     parser.add_argument("--dump-mi-path", default=None, help="If set, dump MI scores here (.npy)")
     parser.add_argument("--dump-puc-path", default=None, help="If set, dump pre-context PUC scores here (.npy)")
@@ -81,20 +87,25 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(e))
         return 2
 
-    if args.backend == "cuda":
+    if args.backend == "cuda" or args.bb_backend == "cuda":
         _say("Checking for CUDA availability...")
         from .cuda import cuda_available
 
         if not cuda_available():
-            _say(
-                "ERROR: CUDA backend requested, but cupy is not installed or no functional "
-                "GPU was detected. Try running with --backend cpu"
-            )
-            return 1
-        _say("CUDA GPU detected successfully.")
+            # The PUC backend has no CPU fallback, so a missing GPU is fatal
+            # there; Bayesian blocks falls back on its own with a warning.
+            if args.backend == "cuda":
+                _say(
+                    "ERROR: CUDA backend requested, but cupy is not installed or no functional "
+                    "GPU was detected. Try running with --backend cpu --bb-backend cpu"
+                )
+                return 1
+        else:
+            _say("CUDA GPU detected successfully.")
 
     config = PIDCConfig(
         backend=args.backend,
+        bb_backend=args.bb_backend,
         discretizer=args.discretizer,
         estimator=args.estimator,
         dump_mi_path=args.dump_mi_path,
@@ -112,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  n_bins           = {args.n_bins}")
     print(f"  base             = {args.base}")
     print(f"  backend          = {config.backend}")
+    print(f"  bb_backend       = {config.bb_backend}")
     print(f"  dump_mi_path     = {config.dump_mi_path or 'none'}")
     print(f"  dump_puc_path    = {config.dump_puc_path or 'none'}")
     print(f"  verbose          = {config.verbose}")

@@ -41,7 +41,8 @@ Runtime configuration for PUC/PIDC network inference.
 Throws an `ArgumentError` if `backend` is not `:cpu` or `:cuda`.
 """
 Base.@kwdef struct PIDCConfig
-    backend::Symbol = :cuda                     # :cuda (default) or :cpu
+    backend::Symbol = :cuda                     # PUC backend: :cuda or :cpu
+    bb_backend::Symbol = :cuda                  # Bayesian blocks backend: :cuda or :cpu
     discretizer::String = "bayesian_blocks"     # mirrors existing default
     estimator::String = "maximum_likelihood"    # mirrors existing default
     dump_mi_path::Union{Nothing,String} = nothing   # Output stem/path; writes *_mi.npy
@@ -50,6 +51,7 @@ Base.@kwdef struct PIDCConfig
     # Inner constructor for automatic validation
     function PIDCConfig(
         backend,
+        bb_backend,
         discretizer,
         estimator,
         dump_mi_path,
@@ -60,8 +62,12 @@ Base.@kwdef struct PIDCConfig
         if !(backend in (:cpu, :cuda))
             throw(ArgumentError("backend must be :cpu or :cuda, got :$backend"))
         end
+        if !(bb_backend in (:cpu, :cuda))
+            throw(ArgumentError("bb_backend must be :cpu or :cuda, got :$bb_backend"))
+        end
         new(
             backend,
+            bb_backend,
             discretizer,
             estimator,
             dump_mi_path,
@@ -71,7 +77,7 @@ Base.@kwdef struct PIDCConfig
     end
 end
 
-# NumPy output helpers
+# --- NumPy output helpers -----------------------------------------
 
 """
     _npy_output_path(file_path) -> String
@@ -142,6 +148,40 @@ end
 
 
 """
+    Node(label::AbstractString, raw_values::AbstractVector{<:Real},
+         discretizer, estimator, number_of_bins)
+
+Construct a `Node` directly from a label and typed numeric values. This path
+avoids materializing the legacy mixed-type `Matrix{Any}` row when loading HDF5
+columns, reducing allocation and type instability without changing the
+underlying discretization or probability calculations.
+"""
+function Node(
+    label::AbstractString,
+    raw_values::AbstractVector{<:Real},
+    discretizer,
+    estimator,
+    number_of_bins,
+)
+    values = collect(Float64, raw_values)
+
+    # Raw values are mapped to their bin IDs.
+    binned_values = zeros(Int, length(values))
+
+    # If the discretizer is Bayesian blocks, number_of_bins will be
+    # overwritten by the ideal number of bins. Otherwise, it will remain
+    # the same as the value passed in.
+    number_of_bins = get_bin_ids!(values, discretizer, number_of_bins, binned_values)
+
+    probabilities = get_probabilities(
+        estimator,
+        get_frequencies_from_bin_ids(binned_values, number_of_bins),
+    )
+
+    return Node(String(label), binned_values, number_of_bins, probabilities)
+end
+
+"""
     Node(line::AbstractArray, discretizer, estimator, number_of_bins) -> Node
 
 Construct a [`Node`](@ref) from one row of a data file: `line` is an array
@@ -152,25 +192,13 @@ which chooses its own bin count) and the per-bin probabilities are then
 estimated using `estimator`.
 """
 function Node(line::AbstractArray, discretizer, estimator, number_of_bins)
-
-    label = string(line[1])
-    raw_values = Array{Float64}(line[2:end])
-
-    # Raw values are mapped to their bin IDs
-    binned_values = zeros(Int, length(raw_values))
-
-    # If the discretizer is Bayesian blocks, number_of_bins will be
-    # overwritten by the ideal number of bins. Otherwise, it will remain
-    # the same as the value passed in.
-    number_of_bins = get_bin_ids!(raw_values, discretizer, number_of_bins, binned_values)
-
-    probabilities = get_probabilities(
+    return Node(
+        string(line[1]),
+        collect(Float64, line[2:end]),
+        discretizer,
         estimator,
-        get_frequencies_from_bin_ids(binned_values, number_of_bins),
+        number_of_bins,
     )
-
-    return Node(label, binned_values, number_of_bins, probabilities)
-
 end
 
 

@@ -74,6 +74,37 @@ def test_get_nodes_h5_sparse_matches_dense(tmp_path):
         np.testing.assert_array_equal(s.binned_values, d.binned_values)
 
 
+def test_get_nodes_h5_matches_text_loader(julia_test_data):
+    # The repository ships the same 200-gene x 1000-cell toy dataset in both
+    # formats, so the two loaders must produce identical nodes.
+    h5_nodes = get_nodes(str(julia_test_data / "toy_small_200.h5"))
+    text_nodes = get_nodes(str(julia_test_data / "toy_small_200.txt"))
+
+    assert [n.label for n in h5_nodes] == [n.label for n in text_nodes]
+    for from_h5, from_text in zip(h5_nodes, text_nodes):
+        assert from_h5.number_of_bins == from_text.number_of_bins, from_h5.label
+        np.testing.assert_array_equal(from_h5.binned_values, from_text.binned_values)
+
+
+@pytest.mark.julia
+def test_get_nodes_h5_matches_julia(run_julia, julia_test_data, tmp_path):
+    data_file = julia_test_data / "toy_small_200.h5"
+    output = run_julia(
+        f'using FastPIDC\nnodes = get_nodes(raw"{data_file}"; bb_backend=:cpu)\n'
+        'println("LABELS:", join([n.label for n in nodes], ","))\n'
+        'println("NBINS:", join([n.number_of_bins for n in nodes], ","))\n'
+        'println("IDS:", join([sum(n.binned_values) for n in nodes], ","))'
+    )
+    fields = {line.split(":", 1)[0]: line.split(":", 1)[1] for line in output.splitlines() if ":" in line}
+
+    nodes = get_nodes(str(data_file))
+    assert [n.label for n in nodes] == fields["LABELS"].split(",")
+    assert [n.number_of_bins for n in nodes] == [int(x) for x in fields["NBINS"].split(",")]
+    # Julia's bin ids are 1-indexed, so its per-node sum is larger by one per sample.
+    n_samples = nodes[0].binned_values.size
+    assert [int(n.binned_values.sum()) + n_samples for n in nodes] == [int(x) for x in fields["IDS"].split(",")]
+
+
 def test_get_nodes_h5_missing_gene_names_raises(tmp_path):
     path = tmp_path / "bad.h5"
     with h5py.File(path, "w") as f:

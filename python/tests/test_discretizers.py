@@ -74,9 +74,20 @@ def test_get_bin_ids_binarize():
     np.testing.assert_array_equal(ids, [0, 1, 0, 1])
 
 
-def test_get_bin_ids_unknown_mode_falls_back_to_uniform_width():
-    ids_fallback, nbins_fallback = get_bin_ids(np.arange(10.0), "nonsense", 5)
+def test_get_bin_ids_unknown_mode_warns_and_falls_back_to_uniform_width():
+    with pytest.warns(RuntimeWarning, match="doesn't exist"):
+        ids_fallback, nbins_fallback = get_bin_ids(np.arange(10.0), "nonsense", 5)
     ids_uw, nbins_uw = get_bin_ids(np.arange(10.0), "uniform_width", 5)
+    assert nbins_fallback == nbins_uw
+    np.testing.assert_array_equal(ids_fallback, ids_uw)
+
+
+def test_get_bin_ids_uniform_count_warns_and_falls_back_to_uniform_width():
+    # Heavily repeated values make the equal-count edges non-unique.
+    values = np.array([0.0] * 9 + [1.0])
+    with pytest.warns(RuntimeWarning, match="Uniform count failed"):
+        ids_fallback, nbins_fallback = get_bin_ids(values, "uniform_count", 5)
+    ids_uw, nbins_uw = get_bin_ids(values, "uniform_width", 5)
     assert nbins_fallback == nbins_uw
     np.testing.assert_array_equal(ids_fallback, ids_uw)
 

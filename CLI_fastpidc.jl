@@ -80,7 +80,8 @@ Basic options:
   --base INT              Log base for MI (2, e, 10). Default: 2
 
 Execution / Environment:
-  --backend STR           'cuda' (default) or 'cpu'. 
+  --backend STR           PUC backend: 'cuda' (default) or 'cpu'.
+  --bb-backend STR        Bayesian-block backend: 'cuda' (default) or 'cpu'.
   --output-format STR     'tsv' (default) or NumPy binary 'npy'
                           Note: To run on multiple CPU threads, use the Julia flag:
                           `julia -t auto command_line_fastpidc.jl ...`
@@ -96,7 +97,7 @@ Other:
 Example:
   julia --project=. command_line_fastpidc.jl \\
     --infile X.txt --outfile edges.tsv \\
-    --backend cuda
+    --backend cuda --bb-backend cuda
 """
 
 function main()
@@ -132,16 +133,22 @@ function main()
     # ----------------- Execution Environment ----------------
     n_threads_act = Threads.nthreads()
     backend = Symbol(lowercase(get(args, "backend", "cuda")))
+    bb_backend = Symbol(lowercase(get(args, "bb-backend", "cuda")))
+
+    backend in (:cpu, :cuda) ||
+        error("Unsupported --backend=$backend. Use 'cpu' or 'cuda'.")
+    bb_backend in (:cpu, :cuda) ||
+        error("Unsupported --bb-backend=$bb_backend. Use 'cpu' or 'cuda'.")
 
     # --- FAST FAIL GPU CHECK ---
-    if backend == :cuda
+    if backend == :cuda || bb_backend == :cuda
         @say "Checking for CUDA availability..."
         try
             Core.eval(Main, :(import CUDA))
             is_functional = Core.eval(Main, :(CUDA.functional()))
             if !is_functional
                 error(
-                    "CUDA.jl is installed, but no functional GPU was detected. Try running with --backend cpu",
+                    "CUDA.jl is installed, but no functional GPU was detected. Try running with --backend cpu --bb-backend cpu",
                 )
             end
             @say "CUDA GPU detected successfully."
@@ -150,7 +157,7 @@ function main()
                 rethrow(e)
             else
                 error(
-                    "Failed to load CUDA.jl. Please ensure CUDA is installed in your Julia environment, or run with --backend cpu.",
+                    "Failed to load CUDA.jl. Please ensure CUDA is installed in your Julia environment, or run with --backend cpu --bb-backend cpu.",
                 )
             end
         end
@@ -163,6 +170,7 @@ function main()
     # ----------------- Build PIDCConfig ----------------
     cfg = PIDCConfig(
         backend = backend,
+        bb_backend = bb_backend,
         discretizer = discretizer,
         estimator = estimator,
         dump_mi_path = dump_mi_path,
@@ -180,6 +188,7 @@ function main()
     println("  n_bins           = $n_bins")
     println("  base             = $base")
     println("  backend          = $(cfg.backend)")
+    println("  bb_backend       = $(cfg.bb_backend)")
     println("  JULIA_NUM_THREADS= $n_threads_act")
     println(
         "  dump_mi_path     = $(cfg.dump_mi_path === nothing ? "none" : cfg.dump_mi_path)",

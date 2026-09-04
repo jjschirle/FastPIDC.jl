@@ -98,6 +98,16 @@ DiscretizeBayesianBlocks
 binedges
 ```
 
+### Bayesian Blocks internals
+
+```@docs
+FastPIDC.BayesianBlocksProblem
+FastPIDC.BayesianBlocksSolution
+FastPIDC.prepare_bayesian_blocks
+FastPIDC.solve_bayesian_blocks_cpu
+FastPIDC._build_nodes
+```
+
 ### Information measures
 
 ```@docs
@@ -136,6 +146,9 @@ FastPIDCCUDAExt
 FastPIDCCUDAExt._kernel_source_path
 FastPIDCCUDAExt._compile_ptx
 FastPIDCCUDAExt._get_module
+FastPIDCCUDAExt._bb_kernel_name
+FastPIDC.bayesian_blocks_cuda_available
+FastPIDC.solve_bayesian_blocks_cuda
 ```
 
 The GPU kernels themselves (`joint_counts_kernel`, `mi_si_kernel`,

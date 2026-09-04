@@ -56,7 +56,7 @@ function get_bin_ids!(values_x, mode, number_of_bins, bin_ids)
                 values_x,
             )
         catch
-            bin_ids = encode(
+            bin_ids[1:end] = encode(
                 LinearDiscretizer(
                     binedges(DiscretizeUniformWidth(number_of_bins), values_x),
                 ),

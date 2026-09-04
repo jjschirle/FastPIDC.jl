@@ -2,7 +2,6 @@ using FastPIDC
 using Test
 using CUDA
 using Statistics
-using LinearAlgebra
 const DATA_DIR = joinpath(dirname(@__FILE__), "data")
 
 # Only run if GPU is available
@@ -14,6 +13,18 @@ if CUDA.functional()
 
         config_cpu = PIDCConfig(backend = :cpu, verbose = false)
         config_cuda = PIDCConfig(backend = :cuda, verbose = false)
+        cuda_ext = Base.get_extension(FastPIDC, :FastPIDCCUDAExt)
+        @test cuda_ext !== nothing
+
+        @testset "Compact Bayesian Blocks GPU integer type selection" begin
+            @test cuda_ext._smallest_unsigned_type(34) == UInt8
+            @test cuda_ext._smallest_unsigned_type(255) == UInt8
+            @test cuda_ext._smallest_unsigned_type(256) == UInt16
+            @test cuda_ext._smallest_unsigned_type(38_176) == UInt16
+            @test cuda_ext._smallest_unsigned_type(65_535) == UInt16
+            @test cuda_ext._smallest_unsigned_type(65_536) == UInt32
+            @test_throws ArgumentError cuda_ext._smallest_unsigned_type(-1)
+        end
 
         # We need to call the internal matrix generators directly, not just the Network wrapper
         mi_cpu, puc_cpu = FastPIDC.compute_puc_full(nodes, config = config_cpu, base = 2)
@@ -29,7 +40,7 @@ if CUDA.functional()
 
         # --- TEST 2: Determinism (Race Condition Check) ---
         @testset "GPU Determinism" begin
-            # Run the GPU calculation twice on the exact same data
+            # Compare the two loader paths on the same data
             mi_gpu1, puc_gpu1 = FastPIDC.compute_puc_full_cuda(nodes, config_cuda, 2)
             mi_gpu2, puc_gpu2 = FastPIDC.compute_puc_full_cuda(nodes, config_cuda, 2)
 
@@ -70,10 +81,10 @@ if CUDA.functional()
         # --- TEST 4: txt vs. H5 Determinism ---
         @testset "txt vs. H5 Determinism" begin
             node_txt = get_nodes(dataset)
-            node_h5 =  get_nodes(joinpath(DATA_DIR, "toy_small_200.h5"))
-            # Run the GPU calculation twice on the exact same data
-            mi_txt, puc_txt = FastPIDC.compute_puc_full_cuda(nodes, config_cuda, 2)
-            mi_h5, puc_h5 = FastPIDC.compute_puc_full_cuda(nodes, config_cuda, 2)
+            node_h5 = get_nodes(joinpath(DATA_DIR, "toy_small_200.h5"))
+            # Compare the two loader paths on the same data
+            mi_txt, puc_txt = FastPIDC.compute_puc_full_cuda(node_txt, config_cuda, 2)
+            mi_h5, puc_h5 = FastPIDC.compute_puc_full_cuda(node_h5, config_cuda, 2)
 
             # These should be bit-for-bit identical. If they aren't, 
             # there is an atomic race condition or uninitialized memory.
