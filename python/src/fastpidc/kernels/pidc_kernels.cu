@@ -8,18 +8,19 @@
 // Proportional Unique Contribution (PUC) scores.
 //
 // It is written in plain CUDA C (no Julia- or Python-specific glue) so it
-// can be compiled and launched from either language's GPU bindings:
-//   * Python: loaded at runtime via `cupy.RawModule` (see
-//     `fastpidc.cuda`), which invokes nvrtc to compile this source.
-//   * Julia: the FastPIDC.jl CUDA extension currently ships its own
-//     CUDA.jl-native kernels (functionally equivalent, predating this
-//     shared file) rather than loading this source directly, since
-//     driving nvrtc-compiled raw kernels from CUDA.jl requires additional
-//     plumbing (PTX loading via `CuModule`) that has not yet been
-//     verified against a GPU as part of this change. Migrating the Julia
-//     extension to load this same file is tracked as follow-up work; until
-//     then, this file is the reference the two implementations are kept
-//     numerically consistent with.
+// is compiled and launched from either language's GPU bindings, both at
+// runtime, from this one file:
+//   * Python: loaded via `cupy.RawModule` (see `fastpidc.cuda`), which
+//     invokes nvrtc to compile this source.
+//   * Julia: the FastPIDC.jl CUDA extension (`ext/FastPIDCCUDAExt`) shells
+//     out to `nvcc --ptx` to compile this source for the active device's
+//     compute capability, then loads the result with `CUDA.CuModule` and
+//     drives it with `CUDA.cudacall`.
+//
+// Both hosts pass 0-indexed bin ids and marginals in the shapes documented
+// per kernel below; FastPIDC.jl's bin ids are 1-indexed internally, so its
+// host code shifts them down by one before upload (and un-shifts nothing
+// on the way back out, since only float scores cross that boundary).
 //
 // All arrays are indexed 0-based, row-major (C order), and passed as flat
 // buffers with the shapes documented per kernel.

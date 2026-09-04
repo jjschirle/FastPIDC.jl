@@ -328,8 +328,14 @@ function binedges(alg::DiscretizeBayesianBlocks, data::AbstractArray{N}) where {
         best[K] = best_val
     end
 
-    change_points = zeros(Int64, n)
-    i_cp = n + 1
+    # Backtracking can require up to n + 1 stored positions (when the
+    # optimal partition puts every point in its own block, so the chain of
+    # change points visits every one of the n + 1 edges); allocate for that
+    # worst case; the array used to be sized `n`, which was one short and
+    # raised a BoundsError for exactly that case (e.g. data with very few
+    # unique values, one of which is a singleton outlier).
+    change_points = zeros(Int64, n + 1)
+    i_cp = n + 2
     ind = n + 1
     while true
         i_cp -= 1

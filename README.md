@@ -25,12 +25,13 @@ automatically when `julia` isn't on `PATH`, e.g. in most CI runs) using the
 shared fixtures under `test/data/` and `test/baseline_outputs/` - these are
 Julia-agnostic edge lists, so both packages can use them without conflict.
 
-The two packages' GPU acceleration is meant to share one implementation:
-the CUDA kernels live in
+The two packages' GPU acceleration shares one implementation: the CUDA
+kernels live in
 [`python/src/fastpidc/kernels/pidc_kernels.cu`](python/src/fastpidc/kernels/pidc_kernels.cu),
 written in plain CUDA C so they can be compiled from either language.
-Python's `cuda` backend loads that file directly; see its header comment
-for the current status of wiring the Julia extension up to the same file.
+Python's `cuda` backend loads it via `cupy` (nvrtc); the Julia extension
+(`ext/FastPIDCCUDAExt`) compiles it with `nvcc` and drives it with
+`CUDA.jl`'s `cudacall` - see that file's header comment for both.
 
 When changing the algorithm, update both `src/`/`ext/` (Julia) and
 `python/src/fastpidc/` (Python and the shared kernel) together, and re-run

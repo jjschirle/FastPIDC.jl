@@ -2,6 +2,7 @@ using FastPIDC
 using Test
 using CUDA
 using Statistics
+using LinearAlgebra
 const DATA_DIR = joinpath(dirname(@__FILE__), "data")
 
 # Only run if GPU is available

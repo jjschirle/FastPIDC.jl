@@ -25,7 +25,9 @@ Runtime configuration for PUC/PIDC network inference.
 
 # Fields
 * `backend::Symbol`: computation backend, either `:cuda` (default, requires
-  `using CUDA` and a functional GPU) or `:cpu`.
+  `using CUDA`, a functional GPU, and `nvcc` on `PATH` to compile the
+  shared kernel source the first time it's used - see `ext/FastPIDCCUDAExt`)
+  or `:cpu`.
 * `discretizer::String`: discretization method, mirrors the default used by
   [`get_nodes`](@ref).
 * `estimator::String`: probability estimator, mirrors the default used by
