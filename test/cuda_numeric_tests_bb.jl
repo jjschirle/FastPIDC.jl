@@ -1,7 +1,6 @@
 using FastPIDC
 using Test
 using CUDA
-using LinearAlgebra
 using Statistics
 
 const BB_NUMERIC_DATA_DIR = joinpath(dirname(@__FILE__), "data")
@@ -89,8 +88,8 @@ if CUDA.functional()
         @test getfield.(nodes_gpu, :label) == getfield.(nodes_cpu, :label)
         @test size(mi_gpu) == size(mi_cpu)
         @test size(puc_gpu) == size(puc_cpu)
-        @test issymmetric(mi_cpu)
-        @test issymmetric(puc_cpu)
+        @test mi_cpu == transpose(mi_cpu)
+        @test puc_cpu == transpose(puc_cpu)
         @test isapprox(mi_gpu, transpose(mi_gpu); atol = 1e-8, rtol = 1e-10)
         @test isapprox(puc_gpu, transpose(puc_gpu); atol = 1e-8, rtol = 1e-10)
 
