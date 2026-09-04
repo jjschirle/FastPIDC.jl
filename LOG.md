@@ -250,6 +250,137 @@ isolating direct regulatory edges yet.
 
 Full per-target table: `k_out.csv` in the session scratchpad (not committed).
 
+---
+
+## 2026-09-04 — Zero-as-own-bin discretizer
+
+Implemented `fastpidc.discretizers.get_bin_ids_zero_as_own_bin` (Stage 2's discretizer, per
+STATE.md item 2): exact zeros get bin 0, nonzero values are equal-frequency ("uniform_count")
+binned into the remaining `number_of_bins - 1` bins. Wired into the existing `get_bin_ids`
+dispatcher as `mode="zero_as_own_bin"`, so it's usable directly through the public
+`Node.from_raw_values(..., discretizer="zero_as_own_bin", ...)` API — turned out **not** to need
+the "construct `Node` by hand, bypassing the provided discretizers" workaround flagged in the
+2026-09-04 API note #2; adding one function and one dispatch branch was enough. Falls back to a
+plain zero/nonzero binarization if there isn't enough nonzero data to also equal-frequency-split it
+(fewer nonzero values than requested bins minus one, or no nonzero values at all). Unit tests added
+to `python/tests/test_discretizers.py` (zero isolation, equal-frequency counts on the nonzero
+remainder, all-zero collapse, small-data fallback, dispatch-vs-direct-call equivalence) — 17/17
+pass in that file, 78 passed / 1 skipped across the full `python/` suite. Not yet run against real
+data; that's interventional Checkpoint 1 (MI invariance under equal-frequency binning), still open.
+
+## 2026-09-04 — Add `pid_triple`
+
+Added `fastpidc.pid` (new module): `pid_triple(source1, source2, target, estimator=, base=)` →
+`PIDTriple(redundancy, unique1, unique2, synergy, mi1, mi2, mi_joint)`, closing the gap flagged in
+the 2026-09-04 API note #5 and required by the interventional plan's own instruction to add this
+before Stage 6 (H2). Built from the existing pieces, per that note's sketch:
+`redundancy = apply_redundancy_formula(target.probabilities, si1, si2, base)` where `si1`/`si2` come
+from `get_mi_and_si(source_i, target, ...)` (using `target.probabilities` directly rather than
+recomputing the marginal, since `Node.from_raw_values` already computed it with a matching
+estimator); `unique_i = mi_i - redundancy`; `synergy = mi_joint - redundancy - unique1 - unique2`,
+where `mi_joint` is the MI of a **joint-binned "combined" node** (new helper `combined_node`: bin id
+= `source1_bin * source2.number_of_bins + source2_bin`) against `target`. Still only supports
+`I_min` as the redundancy measure — no new formula introduced, so Checkpoint 4's
+redundancy-measure-robustness caveat (no BROJA/I_ccs in this package) is unchanged.
+
+Verified against known-analytic PID cases in `python/tests/test_pid.py` rather than just
+structural checks: XOR gate (X, Y independent fair bits, Z = X⊕Y) recovers ≈0 redundancy/uniques
+and ≈1 bit of pure synergy; identical sources (Y := X, Z := X) recover ≈0 unique/synergy and
+redundancy ≈ MI(X,Z) ≈ 1 bit; fully independent (X, Y, Z all independent) recovers ≈0 everywhere;
+a general random-XOR-target case checks the decomposition identity
+`mi_joint == redundancy + unique1 + unique2 + synergy` holds to floating-point precision. All 5
+pass. Exposed at the package top level (`fastpidc.pid_triple`, `fastpidc.combined_node`,
+`fastpidc.PIDTriple`). Not yet exercised on real intervention-indicator/gene/gene triples from the
+Arc data — that's Stage 6 itself, still not started (needs Stage 3's observational skeleton and a
+binned intervention-indicator node first).
+
+## 2026-09-04 — Cell-cycle / cell-state conditioning (companion plan D0 blocker)
+
+Implemented `analysis/scripts/cell_cycle.py` to address the D0 caveat: score every cell for S-phase
+and G2M-phase activity using the standard Tirosh et al. / Seurat `cc.genes.updated.2019` marker
+lists (42/43 S genes and 54/54 G2M genes found in `var_names`), via the same algorithm as
+`scanpy.tl.score_genes` / Seurat `AddModuleScore` (mean expression of the gene set minus mean
+expression of a size-matched, expression-bin-matched control set) — implemented directly rather
+than adding `scanpy` as a dependency for one function. Then regressed both scores out of the
+gene-major filtered expression matrix (11,942 × 221,273) via **vectorized OLS across all genes at
+once**, not a per-gene Python loop: for design matrix `D` (n_cells × 3: intercept, S_score,
+G2M_score) and gene-major data `M` (n_genes × n_cells), used the identity
+`B = (D^T D)^-1 (M D)^T` to get per-gene coefficients without ever transposing the 11 GB `M` array
+(`D^T M^T = (M D)^T`, and `M @ D` is a cheap n_genes×3 matmul) — the same "watch memory layout"
+lesson from Stage 4's I/O bottleneck, applied preemptively this time instead of discovered the hard
+way. Output: `X_resid_genemajor.npy` (same shape as the input).
+
+**Only ~1.5% of per-gene variance was explained by the two cell-cycle scores.** Smaller than hoped
+given how dramatic the D0 out-degree inflation looked (up to 97% of the genome "significant" for
+one target) — suggests cell-cycle proper is only part of the confound, and the plan's own
+"differentiation-propensity heterogeneity" axis (a separate, likely larger source of shared
+variance in a self-renewing-but-heterogeneous hESC population) is not captured by cell-cycle
+scoring alone. Re-ran Stage 4 end-to-end (effect matrix → representative-size null calibration →
+BH-FDR) against the residualized array via `rerun_stage4_residualized.py` (parallel output files,
+suffixed `_resid`, rather than overwriting the originals — `E_matrix_resid.npy`,
+`k_out_resid.csv`, etc.) to see whether even that modest variance removal meaningfully shrinks the
+implausible tail of $\hat k^{\mathrm{out}}_g$, given how much statistical power this dataset has
+(a small mean shift can still clear q<0.05 at these sample sizes). **Result and verdict:
+pending — see next LOG.md entry once the rerun finishes and is compared against the original
+`k_out.csv`.**
+
+## 2026-09-04 — CUDA backend validation (Prerequisites item 3)
+
+Installed `cupy-cuda12x==14.2.0` into `analysis/` via `uv add "cupy-cuda12x>=12.0"` (matches
+`python/pyproject.toml`'s `cuda` extra pin) — resolved cleanly against the existing Python ≥3.12
+project in 279ms, no dependency conflicts, only pulled in `cuda-pathfinder` as a transitive
+dependency. Machine has CUDA 12.4 toolkit/headers (`nvcc --version`) under driver 595.84 (CUDA
+13.2, backward-compatible) and an idle RTX 4090 (24 GB, 0% util, no other processes holding it) —
+confirmed via `nvidia-smi` before starting, to make sure this wouldn't collide with the CPU-only
+cell-cycle-conditioning rerun happening in parallel this session. `fastpidc.cuda.cuda_available()`
+returns `True` and `cp.cuda.runtime.getDeviceCount()` reports the GPU correctly; no `CUDA_PATH`
+workaround needed (the headers are found under `/usr` already, one of `_FALLBACK_CUDA_HEADER_DIRS`
+in `fastpidc/cuda.py`).
+
+**Correctness**: `analysis/scripts/cuda_backend_check.py` builds a 40-node synthetic case (latent
+factor + noise, 2,000 cells, 6 bins) and compares `fastpidc.puc.compute_puc_full` (CPU) against
+`fastpidc.cuda.compute_puc_full_cuda` (GPU). Exact bitwise match: `max|MI_cpu - MI_gpu| = 0.0`,
+`max|PUC_cpu - PUC_gpu| = 0.0`. Both backends implement the same closed-form arithmetic on the same
+binned integer data, so exact agreement (not just "close") is the right bar here and it's met.
+
+**Timing/memory profile**, done at the *real* cell count (221,273, not a small stand-in) since both
+compute cost (joint-counts kernel is `O(n^2 * m)`-ish) and device memory (the `(m, n)` int32 binned-
+data array) depend on cell count, not just gene count — using a small `n_cells` would have given a
+memory estimate that's wrong in exactly the way that matters for sizing the real run. Default
+`chunk_size=256`, `n_bins=10` (matches `PIDCConfig`'s actual default number of bins):
+
+| N (genes) | time | GPU pool reserved | device free after |
+|---|---|---|---|
+| 512  | 4.8s   | 0.52 GB | 24.31 / 24.84 GB |
+| 1024 | 31.4s  | 1.05 GB | 23.78 / 24.84 GB |
+| 2048 | 127.5s | 2.13 GB | 22.70 / 24.84 GB |
+
+Time scales quadratically in N as expected (1024→2048 is a 4.06× runtime increase, consistent with
+`O(N^2)` pair-work at fixed cell count); memory scales linearly in N (doubling N roughly doubles
+reserved memory), consistent with the dominant term being the `(cells, genes)` binned-data array
+(`221,273 * N * 4 bytes` for the int32 array alone — e.g. at N=2048 that's already 1.81 GB of the
+2.13 GB measured, the rest split between the kernel's per-chunk counts buffer and the N×N MI/PUC
+output matrices).
+
+**Extrapolation to the real Stage-3 scale** (N=11,942 filtered genes, same 221,273 cells): memory
+≈ 221,273 × 11,942 × 4 bytes (binned data) + 10² × 11,942 × 256 × 4 bytes (counts chunk, chunk_size
+default 256) + 2 × 11,942² × 8 bytes (MI + PUC output matrices) ≈ 10.6 + 1.2 + 2.3 ≈ **~14 GB**,
+comfortably inside the RTX 4090's 24 GB. Time ≈ 127.5s × (11,942 / 2,048)² ≈ **~72 minutes** for one
+full dense PUC pass over the entire filtered gene set. Both numbers are extrapolations from N≤2048
+measurements, not a direct measurement at N=11,942 — a spot-check at an intermediate size (e.g.
+N=4096) before committing a ~70-minute run would be cheap insurance, but nothing in the scaling
+behavior so far suggests a surprise at full width.
+
+**Recommendation, superseding STATE.md's earlier assumption that Stage 3 would need the same
+gene-chunked multiprocessing treatment Stage 4 needed on CPU**: run the full 11,942-gene dense PUC
+in **one GPU call** (`compute_puc_full_cuda`, letting its own internal chunking over the z-axis at
+`chunk_size=256` bound device memory) rather than pre-splitting into a CPU-style job queue — there's
+only one GPU to serialize onto anyway, and 14 GB of 24 GB leaves enough headroom that chunk-size
+tuning for memory is not expected to be necessary. This closes STATE.md Prerequisites item 3; Stage
+3 itself (running this against the real, zero-as-own-bin-discretized, filtered gene set) is still
+not started — it also needs interventional Checkpoint 1 (binning-invariance check) run first, per
+the plan's own ordering.
+
 ## Scratch outputs (not committed)
 
 Intermediate arrays/CSVs from today's session live in the session scratchpad
