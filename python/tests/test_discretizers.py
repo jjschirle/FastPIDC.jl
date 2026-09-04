@@ -7,6 +7,7 @@ from fastpidc.discretizers import (
     binedges_uniform_count,
     binedges_uniform_width,
     get_bin_ids,
+    get_bin_ids_zero_as_own_bin,
 )
 
 
@@ -87,3 +88,47 @@ def test_get_bin_ids_bin_range():
         ids, nbins = get_bin_ids(values, mode, 8)
         assert ids.min() >= 0
         assert ids.max() < nbins
+
+
+def test_zero_as_own_bin_puts_all_zeros_in_bin_zero():
+    rng = np.random.default_rng(2)
+    nonzero = rng.exponential(size=180) + 0.1
+    values = np.concatenate([np.zeros(20), nonzero])
+    rng.shuffle(values)
+
+    ids, nbins = get_bin_ids_zero_as_own_bin(values, 5)
+
+    np.testing.assert_array_equal(ids[values == 0], 0)
+    assert np.all(ids[values != 0] >= 1)
+    assert nbins == 5
+    assert ids.max() == nbins - 1
+
+
+def test_zero_as_own_bin_nonzero_values_equal_frequency():
+    data = np.concatenate([np.zeros(10), np.arange(1, 11, dtype=np.float64)])
+    ids, nbins = get_bin_ids_zero_as_own_bin(data, 3)  # bin 0 = zero, 2 nonzero bins
+    assert nbins == 3
+    nonzero_ids = ids[data != 0]
+    counts = np.bincount(nonzero_ids - 1, minlength=2)
+    np.testing.assert_array_equal(counts, [5, 5])
+
+
+def test_zero_as_own_bin_all_zero_collapses_to_single_bin():
+    ids, nbins = get_bin_ids_zero_as_own_bin(np.zeros(5), 5)
+    assert nbins == 1
+    np.testing.assert_array_equal(ids, 0)
+
+
+def test_zero_as_own_bin_falls_back_to_two_bins_when_too_few_nonzero():
+    data = np.array([0.0, 0.0, 0.0, 1.0, 2.0])
+    ids, nbins = get_bin_ids_zero_as_own_bin(data, 10)  # nonzero.size (2) < number_of_bins - 1 (9)
+    assert nbins == 2
+    np.testing.assert_array_equal(ids, [0, 0, 0, 1, 1])
+
+
+def test_get_bin_ids_dispatches_zero_as_own_bin():
+    data = np.array([0.0, 0.0, 1.0, 2.0, 3.0, 4.0])
+    ids_direct, nbins_direct = get_bin_ids_zero_as_own_bin(data, 3)
+    ids_dispatch, nbins_dispatch = get_bin_ids(data, "zero_as_own_bin", 3)
+    assert nbins_direct == nbins_dispatch
+    np.testing.assert_array_equal(ids_direct, ids_dispatch)
