@@ -22,7 +22,7 @@ if CUDA.functional()
         # --- TEST 1: MI Matrix Symmetry ---
         @testset "MI Matrix Symmetry" begin
             # CPU should be perfectly symmetric
-            @test issymmetric(mi_cpu)
+            @test mi_cpu == transpose(mi_cpu)
             # GPU might have Float32 drift, check with tolerance
             @test isapprox(mi_gpu, transpose(mi_gpu), atol = 1e-8)
         end
