@@ -9,9 +9,15 @@ def test_pidc_config_rejects_bad_backend():
         PIDCConfig(backend="tpu")
 
 
+def test_pidc_config_rejects_bad_bb_backend():
+    with pytest.raises(ValueError, match="bb_backend"):
+        PIDCConfig(bb_backend="tpu")
+
+
 def test_pidc_config_defaults():
     config = PIDCConfig()
     assert config.backend == "cuda"
+    assert config.bb_backend == "cuda"
     assert config.discretizer == "bayesian_blocks"
     assert config.estimator == "maximum_likelihood"
 

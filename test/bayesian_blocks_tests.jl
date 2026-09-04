@@ -153,3 +153,29 @@ end
     @test PIDCConfig(bb_backend = :cpu).bb_backend == :cpu
     @test_throws ArgumentError PIDCConfig(bb_backend = :invalid)
 end
+
+@testset "Discretizer fallback writes bin ids in place" begin
+    # Heavily repeated values make the equal-count edges non-unique, so
+    # `get_bin_ids!` falls back to uniform width. The fallback must fill the
+    # caller's `bin_ids` array, exactly as the non-fallback branches do.
+    values = Float64[fill(0.0, 9); 1.0]
+
+    bin_ids = zeros(Int, length(values))
+    number_of_bins =
+        FastPIDC.get_bin_ids!(values, "uniform_count", 5, bin_ids)
+
+    expected_ids = zeros(Int, length(values))
+    expected_bins =
+        FastPIDC.get_bin_ids!(values, "uniform_width", 5, expected_ids)
+
+    @test number_of_bins == expected_bins
+    @test bin_ids == expected_ids
+    @test all(1 .<= bin_ids .<= number_of_bins)
+
+    # The Node constructor tallies frequencies from these ids, so an unfilled
+    # array would index at zero rather than producing a usable node.
+    node = Node("G", values, "uniform_count", "maximum_likelihood", 5)
+    @test node.number_of_bins == expected_bins
+    @test node.binned_values == expected_ids
+    @test sum(node.probabilities) ≈ 1.0
+end

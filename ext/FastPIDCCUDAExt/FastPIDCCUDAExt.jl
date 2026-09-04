@@ -1,20 +1,21 @@
 """
     FastPIDCCUDAExt
 
-Package extension providing a CUDA-accelerated implementation of
-[`FastPIDC.compute_puc_full_cuda`](@ref), loaded automatically once
+Package extension providing CUDA-accelerated implementations of
+[`FastPIDC.compute_puc_full_cuda`](@ref) and
+[`FastPIDC.solve_bayesian_blocks_cuda`](@ref), loaded automatically once
 `using CUDA` makes the `CUDA` package available alongside `FastPIDC`.
-Selected by passing `config.backend = :cuda` (the default) to
-[`FastPIDC.compute_puc_full`](@ref).
+Selected by passing `config.backend = :cuda` and `config.bb_backend = :cuda`
+(both the default).
 
-Rather than maintaining a second, CUDA.jl-native copy of the PUC kernels,
-this extension compiles and drives the single canonical kernel source
-shared with the Python package, `python/src/fastpidc/kernels/pidc_kernels.cu`
-(see that file's header comment for the algorithm). It is plain CUDA C, so
-it is compiled here with `nvcc` (required on `PATH` in addition to a
-functional GPU) into PTX for the active device's compute capability, then
-loaded with `CUDA.CuModule` and driven with `CUDA.cudacall` - the same
-kernels Python's `cuda` backend loads via `cupy.RawModule`.
+Rather than maintaining a second, CUDA.jl-native copy of the kernels, this
+extension compiles and drives the single canonical kernel source shared with
+the Python package, `python/src/fastpidc/kernels/pidc_kernels.cu` (see that
+file's header comment for both algorithms). It is plain CUDA C, so it is
+compiled here with `nvcc` (required on `PATH` in addition to a functional
+GPU) into PTX for the active device's compute capability, then loaded with
+`CUDA.CuModule` and driven with `CUDA.cudacall` - the same kernels Python's
+`cuda` backend loads via `cupy.RawModule`.
 """
 module FastPIDCCUDAExt
 
@@ -270,158 +271,47 @@ end
 
 FastPIDC.bayesian_blocks_cuda_available() = CUDA.functional()
 
-# Deterministic comparison used by the Bayesian Blocks reduction: higher
-# score wins, with exact ties resolved in favor of the smaller candidate index.
-@inline function _bb_take_other(
-    other_score::Float64,
-    other_i::Int32,
-    current_score::Float64,
-    current_i::Int32,
-)::Bool
-    return other_score > current_score ||
-           (other_score == current_score && other_i < current_i)
-end
-
 """
-    bayesian_blocks_dp_kernel!(...)
+    _bb_kernel_name(CountT, IndexT) -> String
 
-Assign one CUDA block to each gene. Endpoints `K` remain sequential because
-`best[K]` depends on earlier endpoints, while threads within the block evaluate
-candidate starts `i <= K` in parallel. The reduction uses a deterministic
-first-maximum rule: higher score wins, and exact ties choose the smaller `i`.
+Entry point in the shared kernel source for the given prefix-count and
+back-pointer element types. CUDA C has no generics, so `pidc_kernels.cu`
+macro-generates one `extern "C"` kernel per valid type pair and the host
+selects by name.
 """
-function bayesian_blocks_dp_kernel!(
-    prefix_counts::CuDeviceArray{CountT,1},
-    block_lengths::CuDeviceArray{Float64,1},
-    state_offsets::CuDeviceArray{Int64,1},
-    block_offsets::CuDeviceArray{Int64,1},
-    unique_counts::CuDeviceArray{Int32,1},
-    best::CuDeviceArray{Float64,1},
-    last::CuDeviceArray{IndexT,1},
-    final_scores::CuDeviceArray{Float64,1},
-    priors::CuDeviceArray{Float64,1},
-) where {CountT<:Unsigned,IndexT<:Unsigned}
-    gene = Int32(blockIdx().x)
-    tid = Int32(threadIdx().x)
-    nthreads = Int32(blockDim().x)
-    lane = ((tid - 1) & Int32(31)) + 1
-    warp = ((tid - 1) >>> 5) + 1
-    nwarps = nthreads >>> 5
+function _bb_kernel_name(
+    ::Type{CountT},
+    ::Type{IndexT},
+) where {CountT<:Integer,IndexT<:Integer}
+    suffixes = Dict{DataType,String}(
+        UInt8 => "u8",
+        UInt16 => "u16",
+        UInt32 => "u32",
+        UInt64 => "u64",
+    )
 
-    # Keep one candidate per thread and one reduced candidate per warp. The
-    # reduction uses shared memory rather than generic shuffle helpers, keeping
-    # device dispatch fully concrete while requiring only two block barriers.
-    thread_scores = CuStaticSharedArray(Float64, 256)
-    thread_indices = CuStaticSharedArray(Int32, 256)
-    warp_scores = CuStaticSharedArray(Float64, 8)
-    warp_indices = CuStaticSharedArray(Int32, 8)
+    haskey(suffixes, CountT) || throw(
+        ArgumentError(
+            "Bayesian-block prefix counts must be an unsigned type the shared " *
+            "kernel provides (UInt8, UInt16, UInt32 or UInt64); got $CountT",
+        ),
+    )
+    haskey(suffixes, IndexT) || throw(
+        ArgumentError(
+            "Bayesian-block back-pointers must be an unsigned type the shared " *
+            "kernel provides (UInt8, UInt16, UInt32 or UInt64); got $IndexT",
+        ),
+    )
+    # U_g never exceeds the observation count, so only these pairs exist.
+    sizeof(IndexT) <= sizeof(CountT) || throw(
+        ArgumentError(
+            "Bayesian-block back-pointer type $IndexT is wider than the " *
+            "prefix-count type $CountT, which the shared kernel does not " *
+            "instantiate (U_g never exceeds the observation count)",
+        ),
+    )
 
-    @inbounds begin
-        state_start = state_offsets[gene]
-        block_start = block_offsets[gene]
-        n_unique = unique_counts[gene]
-
-        # Match the CPU reference's singleton behavior explicitly. The generic
-        # event-fitness expression has zero block width when U_g == 1, whereas a
-        # constant gene should deterministically return its two outer edges and
-        # an objective score of zero.
-        if n_unique == 1
-            if tid == 1
-                best[state_start] = 0.0
-                last[state_start] = one(IndexT)
-                final_scores[gene] = 0.0
-            end
-            return nothing
-        end
-
-        K = Int32(1)
-        while K <= n_unique
-            block_length_K1 = block_lengths[block_start + Int64(K)]
-            prefix_K = Float64(prefix_counts[state_start + Int64(K) - 1])
-            prior = priors[K]
-
-            local_best = -Inf
-            local_i = typemax(Int32)
-            i = tid
-            while i <= K
-                prefix_before = i == 1 ? 0.0 :
-                                Float64(prefix_counts[state_start + Int64(i) - 2])
-                count = prefix_K - prefix_before
-                width =
-                    block_lengths[block_start + Int64(i) - 1] - block_length_K1
-
-                fit = count * log(count / width) - prior
-                if i > 1
-                    fit += best[state_start + Int64(i) - 2]
-                end
-
-                if _bb_take_other(fit, i, local_best, local_i)
-                    local_best = fit
-                    local_i = i
-                end
-                i += nthreads
-            end
-
-            thread_scores[tid] = local_best
-            thread_indices[tid] = local_i
-            sync_threads()
-
-            # Each warp leader scans its 32 thread-local candidates in a fixed
-            # order. Exact ties still choose the smaller i, matching the CPU
-            # strict-`>` scan independently of launch size.
-            if lane == 1
-                warp_start = (warp - 1) * Int32(32) + 1
-                warp_end = warp_start + Int32(31)
-                warp_best = thread_scores[warp_start]
-                warp_i = thread_indices[warp_start]
-                slot = warp_start + 1
-                while slot <= warp_end
-                    other_score = thread_scores[slot]
-                    other_i = thread_indices[slot]
-                    if _bb_take_other(other_score, other_i, warp_best, warp_i)
-                        warp_best = other_score
-                        warp_i = other_i
-                    end
-                    slot += 1
-                end
-                warp_scores[warp] = warp_best
-                warp_indices[warp] = warp_i
-            end
-            sync_threads()
-
-            if tid == 1
-                block_best = warp_scores[1]
-                block_i = warp_indices[1]
-                warp_slot = Int32(2)
-                while warp_slot <= nwarps
-                    other_score = warp_scores[warp_slot]
-                    other_i = warp_indices[warp_slot]
-                    if _bb_take_other(other_score, other_i, block_best, block_i)
-                        block_best = other_score
-                        block_i = other_i
-                    end
-                    warp_slot += 1
-                end
-
-                state_index = state_start + Int64(K) - 1
-                best[state_index] = block_best
-                # IndexT was selected from max(U_g), so this modular conversion
-                # is exact and avoids a checked integer constructor in device code.
-                last[state_index] = block_i % IndexT
-                if K == n_unique
-                    final_scores[gene] = block_best
-                end
-            end
-
-            # `best[K]` is stored in global memory and is required by every
-            # thread during the next endpoint. Block synchronization makes that
-            # write visible before advancing K.
-            sync_threads()
-            K += 1
-        end
-    end
-
-    return nothing
+    return "bayesian_blocks_dp_$(suffixes[CountT])_$(suffixes[IndexT])"
 end
 
 function _bb_threads_for_max_u(max_u::Integer)
@@ -570,7 +460,9 @@ function _change_points_from_last(last_values, offset::Int, n::Int)
         1 <= state <= n || throw(
             ArgumentError("invalid Bayesian-block state $state while backtracking"),
         )
-        next_ind = Int(last_values[offset + state - 1])
+        # The shared kernel writes 0-based predecessors (see pidc_kernels.cu);
+        # shift back to Julia's 1-based candidate indices here.
+        next_ind = Int(last_values[offset + state - 1]) + 1
         1 <= next_ind <= state || throw(
             ArgumentError(
                 "invalid Bayesian-block back-pointer $next_ind for state $state",
@@ -601,24 +493,29 @@ function _solve_bb_cuda_batch_with_priors(
 
     prefix_gpu = CuArray(prefix_counts)
     block_gpu = CuArray(block_lengths)
-    state_offsets_gpu = CuArray(state_offsets)
-    block_offsets_gpu = CuArray(block_offsets)
+    # `state_offsets`/`block_offsets` are 1-based cursors for host-side slicing;
+    # the shared kernels index 0-based, so convert at the call boundary (as the
+    # PUC path does for `z_start`).
+    state_offsets_gpu = CuArray(state_offsets .- 1)
+    block_offsets_gpu = CuArray(block_offsets .- 1)
     unique_counts_gpu = CuArray(unique_counts)
     best_gpu = CUDA.zeros(Float64, length(prefix_counts))
     last_gpu = CUDA.zeros(IndexT, length(prefix_counts))
     final_scores_gpu = CUDA.zeros(Float64, length(problem_indices))
 
+    bb_kernel = CuFunction(_get_module(), _bb_kernel_name(CountT, IndexT))
+
     try
-        @cuda threads=threads blocks=length(problem_indices) bayesian_blocks_dp_kernel!(
-            prefix_gpu,
-            block_gpu,
-            state_offsets_gpu,
-            block_offsets_gpu,
-            unique_counts_gpu,
-            best_gpu,
-            last_gpu,
-            final_scores_gpu,
-            priors_gpu,
+        cudacall(
+            bb_kernel,
+            (
+                CuPtr{CountT}, CuPtr{Cdouble}, CuPtr{Int64}, CuPtr{Int64},
+                CuPtr{Cint}, CuPtr{Cdouble}, CuPtr{IndexT}, CuPtr{Cdouble},
+                CuPtr{Cdouble},
+            ),
+            prefix_gpu, block_gpu, state_offsets_gpu, block_offsets_gpu,
+            unique_counts_gpu, best_gpu, last_gpu, final_scores_gpu, priors_gpu;
+            blocks=length(problem_indices), threads=threads,
         )
 
         last_values = Array(last_gpu)

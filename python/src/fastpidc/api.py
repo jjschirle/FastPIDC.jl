@@ -56,6 +56,8 @@ def infer_network(
         discretizer=discretizer,
         estimator=estimator,
         number_of_bins=number_of_bins,
+        bb_backend=config.bb_backend,
+        verbose=config.verbose,
     )
 
     if config.verbose:
