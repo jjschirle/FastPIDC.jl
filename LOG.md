@@ -133,9 +133,133 @@ above) and hasn't been run yet; see `STATE.md`.
 
 ---
 
+## 2026-09-04 — Stage 4: real effect matrix (energy distance)
+
+Implemented the actual Stage-4 deliverable this time (not the mean-shift proxy from Checkpoint 0):
+per-gene **energy distance** (Székely & Rizzo) between each of the 150 perturbation targets and
+the NTC pool, vectorized across genes via an O((m+n)·log(m+n))-per-gene merge-rank identity
+(`analysis/scripts/effect_matrix.py::energy_distance_batch`) rather than the naive O(m·n) pairwise
+form or 1.8M individual `scipy.stats.energy_distance` calls (150 targets × 11,942
+gene-filtered genes) — both were checked and are not tractable interactively at this scale.
+Correctness verified against `scipy.stats.energy_distance` on random synthetic data (`sqrt(e2)`
+matches to 1e-6) before running on real data.
+
+Gene set for this and downstream work: Stage 2's own filter (detected in ≥10% of cells, plus
+union of perturbation targets) — 18,080 → **11,942 genes**. All 150 targets already satisfied the
+union clause (they're all in `var_names`), so the filter is really just the detection threshold.
+
+**Near-miss: OOM from over-parallelizing.** First attempt parallelized across all 150 targets at
+full gene width (11,942 genes/target) with `ProcessPoolExecutor(max_workers=46)` on this
+48-core machine. Killed the box: `free -h` showed 187/188 GiB used and 92 GiB of swap in use a
+few minutes in, and the job died (exit 1, empty stderr — almost certainly an OOM kill of one or
+more workers, silently swallowed by `ProcessPoolExecutor`). Root cause: every worker's arrays are
+shaped `(m+n, G)` where `n` is the *fixed* 38,176-cell NTC pool — so per-worker peak memory
+(~15–20 GB at G=11,942, dominated by the `argsort` output and its int64 default dtype) barely
+depends on which target it's processing, and 46 workers all inflate to that peak roughly
+simultaneously. Fixed by (1) chunking genes explicitly (1,500/chunk, so peak scales with chunk
+size, not total gene count) as the actual unit of parallel work — 150 targets × 8 chunks = 1,200
+jobs, and (2) downcasting the sort-order and cumulative-count arrays from `argsort`'s default
+int64 to int32 (safe: array length ≤ ~43,000, far under int32 range), and (3) dropping
+`max_workers` to 16. Measured single-job peak at chunk_size=1500 (worst-case target): **5.7 GB
+RSS** — 16 concurrent ⇒ ~91 GB peak, comfortably under 188 GB even before accounting for jobs not
+all hitting worst-case simultaneously. Verified stable (`free -h` steady in the 45–57 GiB used
+range, swap flat) before leaving it to run unattended. **Lesson for later stages**: this
+same pitfall applies directly to Stage 3's observational-skeleton PUC computation and to any
+GPU-backed run — check peak memory on one representative unit of work before fanning out, not
+after.
+
+**Two more infrastructure snags, both fixed, both worth remembering for Stage 3:**
+
+- **OOM near-miss.** First parallelization attempt used `ProcessPoolExecutor(max_workers=46)`
+  over all 150 targets at full gene width (11,942 genes/worker). `free -h` showed 187/188 GiB
+  used and 92 GiB of swap within minutes; the job died silently (exit 1, empty stderr — an OOM
+  kill of one or more workers, swallowed by the executor). Root cause: every worker's arrays are
+  shaped `(m+n, G)` where `n` is the *fixed* 38,176-cell NTC pool, so per-worker peak memory
+  (~15–20 GB, dominated by `argsort`'s default int64 output) barely depends on the target being
+  processed — 46 workers all inflate to that peak roughly simultaneously. Fixed by chunking genes
+  explicitly (1,500/chunk, so peak scales with chunk size, not total gene count — 150 targets × 8
+  chunks = 1,200 jobs), downcasting `argsort`/cumulative-count arrays to int32, and dropping to 16
+  workers. Measured single-job peak after the fix: 5.7 GB RSS.
+- **I/O bottleneck (looked like a hang, wasn't).** Even after the memory fix, the run appeared to
+  stall for many minutes with workers stuck at "R" state and CPU time barely accumulating —
+  because each worker's gene-chunk was a *fancy-indexed column gather* out of a cell-major
+  `(cells, genes)` array (`X[np.ix_(cell_rows, gene_cols)]`): for every selected row, ~1,500
+  scattered non-contiguous reads out of an 18,080-wide row, times up to ~43,000 rows, times 16
+  concurrent workers hitting the same 16 GB mmap. Fixed by precomputing a **gene-major, gene-filtered
+  contiguous array** once (`(11,942 genes, 221,273 cells)`, `analysis/scratch: X_genemajor_filtered.npy`)
+  so a gene-chunk read is a fast contiguous row-block; cell selection then happens as fancy-indexing
+  on an already-in-RAM small block, not scattered disk reads. That one-time rebuild itself had the
+  same pitfall the first time (built via `X[:, gene_mask]` fancy-indexing on the mmap'd cell-major
+  file — also slow) and was fixed by loading the source array fully into RAM first (sequential read,
+  fast) before slicing/transposing in memory.
+- **Final, healthy run**: 1,200 jobs, 16 workers, chunk_size=1,500 — **995.1s (~16.6 min)**, memory
+  stable at 45–70 GiB throughout, workers genuinely CPU-bound (verified via `top`: 1:1 CPU-time-to-
+  wall-time ratio). `E_matrix.npy` (150 × 11,942, float32) saved.
+- **Correctness sanity check**: `E_matrix.npy` has a handful of tiny negative values (min
+  ≈ −1.4e-5) — expected floating-point noise near zero for this identity, not a bug; clipped to 0
+  downstream. Self-effect signal is enormous and correctly recovered: for each target's own gene,
+  median energy-distance² is ≈2.35 vs. a median of ≈0.0008 across random (target, gene) pairs —
+  roughly 3000×, as expected given how strong the CRISPRi self-knockdown signal already was in
+  Checkpoint 0.
+
+**Null calibration** (`analysis/scripts/null_calibration.py`): NTC/NTC splits at 7 representative
+sizes (50, 200, 500, 1000, 2000, 3000, 4500 — spanning the observed 33–4760 target-size range), 8
+replicates each, same chunked/parallel machinery — 448 jobs, 442.8s, memory-safe throughout (no
+repeat of the earlier issues, since the fixes above applied directly). Null mean and SD both
+scale smoothly and roughly as 1/size across the tested range (mean null e² drops from 0.0096 at
+size 50 to 0.00012 at size 4500 — about 77× over a 90× size range, consistent with what's expected
+for this kind of two-sample statistic) — a useful confirmation that the representative-size
+approach is behaving sensibly, not an artifact.
+
+**Calibration applied** (`analysis/scripts/calibrate_effects.py`): each target's per-gene energy
+distance is z-scored against its own group size's null (log-log interpolated between the two
+bracketing representative sizes), one-sided normal-approximation p-value (energy distance is only
+ever elevated by a real effect), BH-FDR across all 150 × 11,942 = 1,791,300 (target, gene) pairs,
+per the plan's own instruction to correct "across all (g, j)."
+
+**Checkpoint D0 (companion plan) result: technically PASSES, but with an important caveat.**
+Measured effective out-degree $\hat k^{\mathrm{out}}_g$ (genes at q<0.05, excluding the target's own
+gene) ranges from **1,003 to 11,559** out of 11,942 genes across the 150 targets (mean 4,481,
+median 4,133) — no target near zero, real dynamic range (>11× spread), so the letter of the D0 gate
+("non-degenerate $\hat k^{\mathrm{out}}$ spread... not near-zero for most targets") is satisfied.
+Correlation between $\hat k^{\mathrm{out}}_g$ and the target's own cell count is weak and slightly
+*negative* (r = −0.12), so this isn't simply a power/n artifact in the crude sense.
+**But**: the top of that range means some targets have "significant" shifts in **97% of the
+filtered genome** — a number that is not a credible functional out-degree for a single gene's
+regulatory targets by any biological standard, and is exactly the failure mode the interventional
+plan's own Checkpoint 0 "Secondary concern" flagged in advance: *"hESC are a self-renewing
+pluripotent population with strong cell-cycle structure and differentiation-propensity
+heterogeneity. That variance will dominate MI. Cell-cycle regression or explicit conditioning is
+not optional here."* At this UMI depth and these cell counts, any perturbation that nudges cell
+state/cycle composition will register as "significant" against thousands of genes through that
+shared axis, not through 150 independent direct regulatory programs. **Conclusion: D0 passes as
+literally specified, but $\hat k^{\mathrm{out}}_g$ as currently computed is not yet trustworthy as
+an out-degree *prior* for the companion plan's V3/V4 — cell-cycle/state conditioning (regression or
+explicit stratification) needs to happen before this number means what the companion plan wants it
+to mean.** This is the next concrete blocker to close, not a stopping point — flagged here rather
+than glossed over.
+
+**Interventional Checkpoint 3, second half (known pluripotency edges): recovered, cleanly.**
+`SOX2` (the one pluripotency gene that's both measured and a perturbation target) shows extremely
+significant shifts in both `POU5F1` (q≈0, energy-distance²=0.071) and `NANOG` (q≈0,
+energy-distance²=0.135) — the canonical hESC pluripotency circuit is recovered as a strong positive
+control. Caveat: `SOX2` itself has one of the largest $\hat k^{\mathrm{out}}$ values (8,941/11,942,
+~75%), so this specific pair recovering "significant" carries the same cell-state-confound caveat
+as D0 above — it's necessary-but-not-sufficient evidence, not proof the calibration is cleanly
+isolating direct regulatory edges yet.
+
+Full per-target table: `k_out.csv` in the session scratchpad (not committed).
+
 ## Scratch outputs (not committed)
 
 Intermediate arrays/CSVs from today's session live in the session scratchpad
-(`/tmp/claude-1000/.../scratchpad/`), not in the repo: `X_dense.npy` (16 GB densified matrix — 
-regenerate, don't commit), `self_effect_screen.csv`, `phenotype_screen.csv`. Regenerate from the
-h5ad rather than relying on these persisting.
+(`/tmp/claude-1000/.../scratchpad/`), not in the repo — regenerate from the h5ad rather than
+relying on these persisting: `X_dense.npy` / `X_norm_log.npy` (16 GB, cell-major raw / normalized),
+`X_genemajor_filtered.npy` (10.6 GB, gene-major + gene-filtered, the layout `effect_matrix.py` and
+`null_calibration.py` actually read), `gene_filter_mask.npy`, `self_effect_screen.csv`,
+`phenotype_screen.csv`, `E_matrix.npy` + `E_matrix_meta.pkl` (Stage-4 effect matrix),
+`null_mean_by_size.npy` / `null_sd_by_size.npy` + `null_meta.pkl` (representative-size null),
+`E_zscores.npy` / `E_qvalues.npy` (calibrated), `k_out.csv` (measured effective out-degree per
+target). The three scripts (`effect_matrix.py`, `null_calibration.py`, `calibrate_effects.py`, all
+under `analysis/scripts/`) are committed and reproduce all of this from the h5ad + cached
+normalization step; only the huge intermediate arrays themselves aren't kept.

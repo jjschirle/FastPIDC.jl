@@ -27,7 +27,7 @@ Legend: ✅ done · 🟡 in progress / partial · ⬜ not started · 🚫 blocke
 | **0** | ≥~2,000 reciprocal testable pairs | ✅ **PASS** | 150 targets (not the assumed ~300 — see `LOG.md`), all clear cell-count + phenotype screens. `C(150,2) = 11,175` pairs. No Replogle fallback needed for feasibility. |
 | 1 | MI invariant under equal-frequency binning | ⬜ | Not started. Needs Stage 2 discretizer implementation first (zero-as-own-bin isn't one of `fastpidc`'s built-ins — must be hand-rolled and fed in via `Node` construction, see `LOG.md` API note #2). |
 | 2 | Bootstrap edge recovery >50% at top-k | ⬜ | Not started. Needs Stage 3 (observational skeleton on NTC cells) first, which needs a working discretization pipeline and — at 18,080 genes — realistically needs the CUDA backend (`cupy` not yet installed, RTX 4090 available). |
-| 3 | Self-effects present; known pluripotency edges recovered | 🟡 | Self-effect half done today as a Checkpoint-0 byproduct: **150/150 pass** (q<0.05, down). Pluripotency-edge recovery half not started (needs the actual network, i.e. Stage 3). `POU5F1`/`NANOG` measured-not-targeted, `SOX2` measured-and-targeted — noted for later. |
+| 3 | Self-effects present; known pluripotency edges recovered | ✅ | Self-effect: **150/150 pass** (q<0.05, down; Checkpoint-0 byproduct). Pluripotency edges: **recovered** — `SOX2` (measured + targeted) shows q≈0 shifts in both `POU5F1` and `NANOG`, using the real Stage-4 effect matrix (not the Checkpoint-0 proxy). Caveat in `LOG.md`: `SOX2`'s own $\hat k^{\mathrm{out}}$ is ~75% of the filtered genome, so this is necessary-but-not-sufficient given the cell-state-confound issue flagged under D0 below. |
 | 4 | Sibling calls stable across redundancy measures (I_min vs BROJA/I_ccs) | ⬜ | Not started; blocked on Stage 6 existing at all, and on sourcing a non-I_min PID implementation (`fastpidc` only has I_min — see `LOG.md`). |
 | 5 | PID beats mediation regression (H3, the kill criterion) | ⬜ | Not started; last in the pipeline by design. |
 
@@ -38,7 +38,7 @@ Legend: ✅ done · 🟡 in progress / partial · ⬜ not started · 🚫 blocke
 | 1 — Load & QC | 🟡 | Load path solved. Per-cell filters (UMI/gene-count/mito) and mixscape-style per-cell knockdown-efficiency estimate: not started. |
 | 2 — Normalization & discretization | 🟡 | Size-factor + log1p normalization exercised (as a means to Checkpoint 0, not yet as a committed pipeline step). The zero-as-own-bin equal-frequency discretizer is not implemented against `fastpidc.discretizers` yet. |
 | 3 — Observational skeleton | ⬜ | Not started. |
-| 4 — Directed effect matrix (energy distance) | ⬜ | Not started — **note**: today's phenotype screen used a mean-shift proxy, explicitly *not* this. Real Stage 4 must use energy distance per the plan. |
+| 4 — Directed effect matrix (energy distance) | ✅ | Done: `analysis/scripts/effect_matrix.py`. Real energy distance (not the Checkpoint-0 mean-shift proxy), 150 targets × 11,942 genes, NTC-split significance calibration via `null_calibration.py` + `calibrate_effects.py` (BH-FDR across all pairs, per the plan). Hit and fixed an OOM and an I/O-layout bottleneck along the way — see `LOG.md`. **Open issue carried forward**: measured effective out-degree is inflated by hESC cell-state/cycle confounding, exactly as the plan's own Checkpoint-0 "Secondary concern" anticipated — see D0 below. |
 | 5 — Orientation (H1) | ⬜ | Not started; depends on Stage 4. |
 | 6 — Intervention-indicator PID (H2) | 🚫 | Blocked on adding the `pid_triple`-equivalent primitive to `fastpidc` (see Prerequisites). |
 | 7 — Baselines (H3) | ⬜ | Not started. |
@@ -49,7 +49,7 @@ Legend: ✅ done · 🟡 in progress / partial · ⬜ not started · 🚫 blocke
 
 | # | Gate | Status | Result |
 |---|---|---|---|
-| **D0** | Enough targets with non-degenerate measured $\hat k^{\mathrm{out}}$ | ⬜ | Not started. Needs the *real* Stage-4 effect matrix (energy distance, BH-significant vs NTC-split null), not today's mean-shift proxy — measuring $\hat k^{\mathrm{out}}_g$ per target requires that matrix. |
+| **D0** | Enough targets with non-degenerate measured $\hat k^{\mathrm{out}}$ | 🟡 **PASS, with a caveat that blocks trusting the number yet** | $\hat k^{\mathrm{out}}_g$ ranges 1,003–11,559 / 11,942 genes (>11× spread, none near zero) — technically clears the gate. But the top of that range (~97% of the genome "significant" for one target) is not a credible functional out-degree; almost certainly reflects hESC cell-state/cycle composition shifting under perturbation rather than 150 independent direct regulatory programs, exactly the risk the plan's own Checkpoint 0 "Secondary concern" flagged. **Needs cell-cycle/state regression or stratification before $\hat k^{\mathrm{out}}_g$ is fit as a real degree prior** — that's the concrete next blocker, not a re-run of what's already done. Full table: `k_out.csv` (scratchpad, not committed). |
 | D1 | V2 (hierarchical gamma) does not reduce bootstrap stability | ⬜ | Not started; depends on interventional-plan Stage 3 existing. |
 | D2 | V1 (direction-aware calibration) beats V2 on held-out effect recovery | ⬜ | Not started. |
 | D3 | Known hubs (POU5F1, NANOG, SOX2) survive increasing λ in V3 | ⬜ | Not started; note all three are measured, `SOX2` is also itself a perturbation target. |
@@ -62,14 +62,21 @@ side (raw PUC access confirmed) whenever Stage 3's skeleton exists to calibrate.
 
 ## Immediate next actions (carried over from both plans, reordered by what's actually next)
 
-1. Implement Stage 4's real effect matrix (energy distance, NTC-split null, BH-FDR) — feeds
-   both interventional Checkpoint 3's second half and companion Checkpoint D0. Highest-value next
-   step; nothing else downstream can be evaluated honestly without it.
+1. **Cell-cycle / cell-state conditioning before trusting $\hat k^{\mathrm{out}}_g$.** D0 passes
+   literally but the measured out-degree numbers are almost certainly inflated by shared
+   cell-state/cycle shifts, not 150 independent regulatory programs (see D0 note above). Regress
+   out or stratify by a cell-cycle score before the companion plan's V3/V4 fit a degree prior on
+   this. This is the concrete blocker uncovered by today's work — resolve before building on
+   `k_out.csv` further.
 2. Implement the zero-as-own-bin discretizer and wire it into `fastpidc.Node` construction
    (Stage 2), then run interventional Checkpoint 1 (binning-invariance sanity check).
 3. Install `cupy` and exercise the CUDA backend before attempting a full 18,080-gene PUC run —
    the CPU backend's Python-loop-over-pairs cost is very unlikely to be workable at that gene
-   count (companion + interventional plans both note PUC is inherently O(N³)).
+   count (companion + interventional plans both note PUC is inherently O(N³)). Note from today:
+   even the much cheaper O((m+n)log(m+n)) energy-distance computation needed real attention to
+   memory (chunk sizing) and data layout (gene-major contiguity) to run efficiently in parallel —
+   the same two issues will apply, likely more sharply, to Stage 3's O(N³) PUC computation; check
+   peak memory on one representative unit of work before fanning out, not after.
 4. Add the `pid_triple`-equivalent module to `fastpidc` (new branch work, per the interventional
    plan's own instruction) — needed before Stage 6 / H2, not before.
 5. Literature re-check and ADAPRE/D-SPIN reading — still not started, no dependency on the above.
