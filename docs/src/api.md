@@ -146,7 +146,9 @@ FastPIDCCUDAExt
 FastPIDCCUDAExt._kernel_source_path
 FastPIDCCUDAExt._compile_ptx
 FastPIDCCUDAExt._get_module
-FastPIDCCUDAExt.bayesian_blocks_dp_kernel!
+FastPIDCCUDAExt._bb_kernel_name
+FastPIDC.bayesian_blocks_cuda_available
+FastPIDC.solve_bayesian_blocks_cuda
 ```
 
 The GPU kernels themselves (`joint_counts_kernel`, `mi_si_kernel`,
